@@ -1,0 +1,6 @@
+Origin: Falcon
+Label: Falcon HTTP Framework
+Suite: ./
+Architectures: amd64 arm64
+Components: main
+Description: Official Falcon apt repository

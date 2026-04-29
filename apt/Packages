@@ -1,0 +1,34 @@
+Package: libfalcon-dev
+Version: 1.2.0
+Architecture: amd64
+Maintainer: Falcon CI <daniel.tunyinko@gmail.com>
+Depends: libssl-dev
+Filename: ./libfalcon-dev_1.2.0_amd64.deb
+Size: 310716
+MD5sum: 50b0676422d493215a957cbf5c756eaa
+SHA1: bbe19f1017165fa6fe8ad2e0daa5ac1d464b65b4
+SHA256: 2d2241d2ea4e4843fad3d6a14f2242f1f481ff8b7c32b83cf650542586578b86
+Section: libdevel
+Priority: optional
+Homepage: https://github.com/DAN6256/falcon_sdk
+Description: Falcon HTTP framework - development files
+ High-performance C17 HTTP/1.1 + HTTP/2 server framework.
+ Statically linked; only OpenSSL is needed at link time.
+
+Package: libfalcon-dev
+Version: 1.2.0
+Architecture: arm64
+Maintainer: Falcon CI <daniel.tunyinko@gmail.com>
+Depends: libssl-dev
+Filename: ./libfalcon-dev_1.2.0_arm64.deb
+Size: 312626
+MD5sum: 415f3fcc9f05a5e2875cbd9cb90a5f9f
+SHA1: edd96241bd45be2d9ede57411784ad7a06401e12
+SHA256: 542da2cc48289acacbdaf76b0986cbcac649e1ec2f5c1654d0019c641153065b
+Section: libdevel
+Priority: optional
+Homepage: https://github.com/DAN6256/falcon_sdk
+Description: Falcon HTTP framework - development files
+ High-performance C17 HTTP/1.1 + HTTP/2 server framework.
+ Statically linked; only OpenSSL is needed at link time.
+
