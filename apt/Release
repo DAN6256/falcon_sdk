@@ -1,6 +1,23 @@
-Origin: Falcon
-Label: Falcon HTTP Framework
-Suite: ./
 Architectures: amd64 arm64
 Components: main
+Date: Wed, 29 Apr 2026 14:18:41 +0000
 Description: Official Falcon apt repository
+Label: Falcon HTTP Framework
+Origin: Falcon
+Suite: ./
+MD5Sum:
+ ec318a0210300219e5923a69610e5f23             1200 Packages
+ 8a05036d7d98d52d37c565e89f0d9908              563 Packages.gz
+ daef3235a89818a9cef91d47ba209507              180 Release
+SHA1:
+ 66fd8d854039618ec42b7f84bafb081f5f17a671             1200 Packages
+ 0fdd1a9a944606bd499e87bdda78a2432f0f7f6b              563 Packages.gz
+ a378b6f9d2d01401b6016179fbf0a1c2526f72dc              180 Release
+SHA256:
+ 0ea020be6cca115efa8665c4fcd4f3aa7fc892fd98f7d3d38360da197c763bfc             1200 Packages
+ 8ad7ca327a2d051576ed50931dc3883cbaec63e232b63980075d9485af7cf925              563 Packages.gz
+ 3bfbe6c1192abd20a32bd50a9a4ac3e5a4d82f8d58d4632d770f88f786f9f234              180 Release
+SHA512:
+ c9394f733669aec97d0b81fc93ac1d904339aa149f88bd892248c4f523616c3b8c2a017301493feb23b4ddf483c3b164063aaf0b3c2e32fcdc04649d965f7c7b             1200 Packages
+ 7dba3bcf3a41e88e65ca51f5fb32cbabd197cc7e5acd95c75054fab06a2345eeb9dda376b9a062000254e661903b8e6f96d4c47b6a228efd17dcaf76db2eb659              563 Packages.gz
+ 7e8f6316c6f64ad1e803e4074ddc9d1be4f46eb220fcea1985b9e74fcc31c4f639433b670e4d1ded12e9261de87db500f6168067dcb59f8b74fd0468ab4879c5              180 Release
