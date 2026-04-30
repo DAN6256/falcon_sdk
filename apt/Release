@@ -1,23 +1,23 @@
 Architectures: amd64 arm64
 Components: main
-Date: Wed, 29 Apr 2026 14:18:41 +0000
+Date: Thu, 30 Apr 2026 15:15:26 +0000
 Description: Official Falcon apt repository
 Label: Falcon HTTP Framework
 Origin: Falcon
 Suite: ./
 MD5Sum:
- ec318a0210300219e5923a69610e5f23             1200 Packages
- 8a05036d7d98d52d37c565e89f0d9908              563 Packages.gz
- daef3235a89818a9cef91d47ba209507              180 Release
+ ab6bee260e20c28c0d42f9ceba7093f6             1200 Packages
+ 664ed364e3a166ccda0e75d80f706cd7              564 Packages.gz
+ bb2fd1fce8e93171f4576edd6546713c              180 Release
 SHA1:
- 66fd8d854039618ec42b7f84bafb081f5f17a671             1200 Packages
- 0fdd1a9a944606bd499e87bdda78a2432f0f7f6b              563 Packages.gz
- a378b6f9d2d01401b6016179fbf0a1c2526f72dc              180 Release
+ 2b65421801f1f7186000cd21d5e4c907ecf5d489             1200 Packages
+ 498b6145deefca6db994d721ea6cb1b29f1c5790              564 Packages.gz
+ d3480c9198969c3eddf01479257923169d99e52a              180 Release
 SHA256:
- 0ea020be6cca115efa8665c4fcd4f3aa7fc892fd98f7d3d38360da197c763bfc             1200 Packages
- 8ad7ca327a2d051576ed50931dc3883cbaec63e232b63980075d9485af7cf925              563 Packages.gz
- 3bfbe6c1192abd20a32bd50a9a4ac3e5a4d82f8d58d4632d770f88f786f9f234              180 Release
+ c01aa720bc776c7b711a01116b06c96ddb64fa2b37260230995f6df5f9e46c8b             1200 Packages
+ b65fb2b58c2fd67044ac2aeeefc252891e615dfdbef9e125bc88b32dfc3613e8              564 Packages.gz
+ be3aa3f54811431e3a728054ae662bba78a9bafd61442293e8c1e3f215fe4a22              180 Release
 SHA512:
- c9394f733669aec97d0b81fc93ac1d904339aa149f88bd892248c4f523616c3b8c2a017301493feb23b4ddf483c3b164063aaf0b3c2e32fcdc04649d965f7c7b             1200 Packages
- 7dba3bcf3a41e88e65ca51f5fb32cbabd197cc7e5acd95c75054fab06a2345eeb9dda376b9a062000254e661903b8e6f96d4c47b6a228efd17dcaf76db2eb659              563 Packages.gz
- 7e8f6316c6f64ad1e803e4074ddc9d1be4f46eb220fcea1985b9e74fcc31c4f639433b670e4d1ded12e9261de87db500f6168067dcb59f8b74fd0468ab4879c5              180 Release
+ 4ce8e58e630da1b1feaa860fba187e3e3d0659a977d98ae066936d0f11fff5910042fb5c96d6da02818efe093d2e357b53e1290c962f229c06059cb7a5201b61             1200 Packages
+ a00549dbc168e7ab96c3b2cfc27733d81414fdf43fc920ed976983d1fcd124bce3b736e131eaa6d2417d6c2d8160c7a0e4d9df9aab1b487a222792d756bd87a1              564 Packages.gz
+ 3605fc644366af34e7090cd6b6eccf1495a9ae72766118db3beecaa94128a14d0ca7f2c8dba5754337e77ee40e997a4c8f7a6583383953c5944047bde2d688fc              180 Release

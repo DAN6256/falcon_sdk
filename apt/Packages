@@ -4,10 +4,10 @@ Architecture: amd64
 Maintainer: Falcon CI <daniel.tunyinko@gmail.com>
 Depends: libssl-dev
 Filename: ./libfalcon-dev_1.2.0_amd64.deb
-Size: 310736
-MD5sum: ea2816ab1221debf77cb1b7d3c1cf28a
-SHA1: 58390fd5f040dbe2749d17bccf330f414eac6d8b
-SHA256: f11a104a904aed6f110307a9c5450fc0e03f4dc14f018e9be9425613e8036fe1
+Size: 310920
+MD5sum: 1025157730d7543cf6271fba638b4884
+SHA1: 14702431e7b2858975fcd005662b712b46909950
+SHA256: 5450f8e6101ecdf4c592465714d1b987adab6dad60fccc59e1e5f86c944a01c6
 Section: libdevel
 Priority: optional
 Homepage: https://github.com/DAN6256/falcon_sdk
@@ -21,10 +21,10 @@ Architecture: arm64
 Maintainer: Falcon CI <daniel.tunyinko@gmail.com>
 Depends: libssl-dev
 Filename: ./libfalcon-dev_1.2.0_arm64.deb
-Size: 313038
-MD5sum: 8410a7a98163c7edcc189122cf7ab97f
-SHA1: 81fc6efe403db3e2dd470cd72df764d9be0e225e
-SHA256: c1770ae1514ee71fcfe3654d62768bd7274955f1d7c21b87ff4262f04fd83595
+Size: 312994
+MD5sum: 803e068f81b73b54cf062c74bca73d42
+SHA1: e8f781707fbd8b162c3ea88a8677865bf5d7372f
+SHA256: c29130aaab3f17150ec6da8a379f3635d863d9dbd707587e146ec1d4ead021ee
 Section: libdevel
 Priority: optional
 Homepage: https://github.com/DAN6256/falcon_sdk
