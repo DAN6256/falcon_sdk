@@ -1112,21 +1112,24 @@ CREATE TABLE IF NOT EXISTS users (
 ```c
 #include <openssl/rand.h>
 
+typedef struct { char username[128]; } SignupCtx;
+
 static void cb_signup(falcon_ctx *ctx, falcon_db_result *r, const char *err) {
     if (err) {
-        /* UNIQUE constraint → username already taken */
         falcon_json_str(ctx, 409, "{\"error\":\"username taken\"}");
         return;
     }
     falcon_db_result_free(r);
 
-    /* Issue token — "sub" is the username extracted from the query param
-       we stashed in the context. Use ctx user-data or re-parse body.
-       For simplicity here we re-read from the DB result above; in practice
-       store the username in a local struct passed through the callback. */
+    SignupCtx  *sc     = falcon_ctx_get_user_data(ctx);
     const char *secret = getenv("FALCON_JWT_SECRET");
-    /* NOTE: in real code pass username through user-data, not re-query */
-    falcon_json_str(ctx, 201, "{\"error\":\"use user-data pattern for username\"}");
+    char *token = jwt_sign(sc->username, secret, 3600);
+    if (!token) { falcon_json_str(ctx, 500, "{\"error\":\"sign failed\"}"); return; }
+
+    cJSON *resp = cJSON_CreateObject();
+    cJSON_AddStringToObject(resp, "token", token);
+    free(token);
+    falcon_json(ctx, 201, resp);
 }
 
 static void signup(falcon_ctx *ctx) {
@@ -1135,39 +1138,40 @@ static void signup(falcon_ctx *ctx) {
 
     cJSON *j_user = cJSON_GetObjectItem(body, "username");
     cJSON *j_pass = cJSON_GetObjectItem(body, "password");
-    if (!cJSON_IsString(j_user) || !cJSON_IsString(j_pass))
+    if (!cJSON_IsString(j_user) || !j_user->valuestring[0] ||
+        !cJSON_IsString(j_pass) || !j_pass->valuestring[0])
         FALCON_ABORT(ctx, 400, "username and password required");
 
-    const char *username = j_user->valuestring;
-    const char *password = j_pass->valuestring;
-
-    /* Generate salt and hash password */
     unsigned char salt[16], hash[32];
     RAND_bytes(salt, sizeof(salt));
-    hash_password(password, salt, hash);
+    hash_password(j_pass->valuestring, salt, hash);
 
-    /* Convert to hex for storage */
     char salt_hex[33], hash_hex[65];
     for (int i = 0; i < 16; i++) sprintf(salt_hex + i*2, "%02x", salt[i]);
     for (int i = 0; i < 32; i++) sprintf(hash_hex + i*2, "%02x", hash[i]);
     salt_hex[32] = hash_hex[64] = '\0';
+
+    /* Store username so cb_signup can include it in the JWT */
+    SignupCtx *sc = malloc(sizeof(*sc));
+    strncpy(sc->username, j_user->valuestring, sizeof(sc->username) - 1);
+    sc->username[sizeof(sc->username) - 1] = '\0';
+    falcon_ctx_set_user_data(ctx, sc, free);
 
     falcon_db_conn *conn = falcon_db_acquire(ctx);
     if (!conn) FALCON_ABORT(ctx, 503, "busy");
 
     falcon_db_async_query(ctx, conn, cb_signup,
         "INSERT INTO users (username, salt_hex, hash_hex) VALUES (?, ?, ?)",
-        FALCON_DB_TEXT, username,
+        FALCON_DB_TEXT, j_user->valuestring,
         FALCON_DB_TEXT, salt_hex,
         FALCON_DB_TEXT, hash_hex,
         FALCON_DB_END);
 }
 ```
 
-> **User-data pattern:** to pass `username` into `cb_signup` without a second DB
-> query, store it in a heap struct before the async call and retrieve it in the
-> callback via `falcon_ctx_userdata` (see Section 9 on Background Tasks for the
-> pattern).
+> **User-data pattern:** to pass data into an async callback, store a heap-allocated
+> struct before the async call with `falcon_ctx_set_user_data(ctx, ptr, free)` and
+> retrieve it inside the callback with `falcon_ctx_get_user_data(ctx)`.
 
 #### Login handler
 
@@ -1179,21 +1183,19 @@ static void cb_login(falcon_ctx *ctx, falcon_db_result *r, const char *err) {
         return;
     }
 
-    /* Row: username, salt_hex, hash_hex */
-    const char *username = falcon_db_result_get(r, 0, 0);
-    const char *salt_hex = falcon_db_result_get(r, 0, 1);
-    const char *hash_hex = falcon_db_result_get(r, 0, 2);
+    /* Copy strings out before freeing the result */
+    char username[128], salt_hex[33], hash_hex[65];
+    strncpy(username, falcon_db_result_get(r, 0, 0) ?: "", sizeof(username) - 1);
+    strncpy(salt_hex, falcon_db_result_get(r, 0, 1) ?: "", sizeof(salt_hex) - 1);
+    strncpy(hash_hex, falcon_db_result_get(r, 0, 2) ?: "", sizeof(hash_hex) - 1);
+    falcon_db_result_free(r);
 
-    /* Re-derive hash from the submitted password */
+    /* Re-derive hash from the submitted password (body JSON is cached per-request) */
+    const char *password = (const char *)falcon_ctx_get_user_data(ctx);
     unsigned char salt[16], expected[32], actual[32];
     for (int i = 0; i < 16; i++) sscanf(salt_hex + i*2, "%02hhx", &salt[i]);
     for (int i = 0; i < 32; i++) sscanf(hash_hex + i*2, "%02hhx", &expected[i]);
-
-    /* password was stored in ctx before the async call (user-data pattern) */
-    const char *password = (const char *)falcon_ctx_userdata(ctx);
     hash_password(password, salt, actual);
-
-    falcon_db_result_free(r);
 
     if (memcmp(actual, expected, 32) != 0) {
         falcon_json_str(ctx, 401, "{\"error\":\"invalid credentials\"}");
@@ -1218,8 +1220,8 @@ static void login(falcon_ctx *ctx) {
     if (!cJSON_IsString(j_user) || !cJSON_IsString(j_pass))
         FALCON_ABORT(ctx, 400, "username and password required");
 
-    /* Store password in ctx so cb_login can verify it */
-    falcon_ctx_set_userdata(ctx, strdup(j_pass->valuestring), free);
+    /* Store password in ctx so cb_login can verify it after the async result arrives */
+    falcon_ctx_set_user_data(ctx, strdup(j_pass->valuestring), free);
 
     falcon_db_conn *conn = falcon_db_acquire(ctx);
     if (!conn) FALCON_ABORT(ctx, 503, "busy");
@@ -1521,7 +1523,7 @@ static void cb(falcon_ctx *ctx, falcon_db_result *r, const char *err) {
     for (int row = 0; row < rows; row++) {
         for (int col = 0; col < cols; col++) {
             const char *col_name = falcon_db_result_col_name(r, col);
-            const char *val      = falcon_db_result_cell(r, row, col);
+            const char *val      = falcon_db_result_get(r, row, col);
             /* val is NULL for SQL NULL values — always check before using */
             if (val)
                 printf("%s = %s\n", col_name, val);
@@ -1757,10 +1759,10 @@ falcon_db_async_query(ctx, conn, cb,
     FALCON_DB_END);
 ```
 
-When reading, `falcon_db_result_cell` returns `"1"` or `"0"`. Compare with `strcmp`:
+When reading, `falcon_db_result_get` returns `"1"` or `"0"`. Compare with `strcmp`:
 
 ```c
-const char *done_val = falcon_db_result_cell(r, row, col);
+const char *done_val = falcon_db_result_get(r, row, col);
 int is_done = done_val && strcmp(done_val, "1") == 0;
 ```
 
@@ -2387,42 +2389,251 @@ package needed at runtime.
 
 ## 17. Full Example: Todo API with JWT
 
-A complete REST API with authentication, persistent storage, and async DB queries.
+A complete, self-contained REST API: signup, login, JWT auth, and todo CRUD — all in one file.
+Copy it to `todo_api.c`, compile, and run. No other files needed.
 
 ```c
+/*
+ * todo_api.c — complete Falcon example
+ *
+ * Compile:
+ *   sudo apt install libsqlite3-dev libpq-dev default-libmysqlclient-dev
+ *   gcc -o todo_api todo_api.c $(pkg-config --cflags --libs --static falcon falcon_db)
+ *
+ * Run:
+ *   FALCON_JWT_SECRET=mysecret ./todo_api
+ */
+
+/* ── includes ────────────────────────────────────────────────────────── */
 #include <falcon/falcon.h>
 #include <falcon/falcon_db.h>
 #include <falcon/falcon_sqlite.h>
 #include <falcon/falcon_mw_jwt.h>
 #include <falcon/falcon_middleware.h>
+#include <openssl/hmac.h>
+#include <openssl/evp.h>
+#include <openssl/rand.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
-static const char *SCHEMA =
-    "CREATE TABLE IF NOT EXISTS todos ("
-    "  id      INTEGER PRIMARY KEY AUTOINCREMENT,"
-    "  user_id TEXT NOT NULL,"
-    "  title   TEXT NOT NULL,"
-    "  done    INTEGER NOT NULL DEFAULT 0,"
-    "  created TEXT NOT NULL DEFAULT (datetime('now'))"
+/* ── schema ──────────────────────────────────────────────────────────── */
+static const char *SCHEMA_USERS =
+    "CREATE TABLE IF NOT EXISTS users ("
+    "  id       INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  username TEXT    NOT NULL UNIQUE,"
+    "  salt_hex TEXT    NOT NULL,"
+    "  hash_hex TEXT    NOT NULL"
     ")";
 
-/* ── health ─────────────────────────────────────────────────────────── */
+static const char *SCHEMA_TODOS =
+    "CREATE TABLE IF NOT EXISTS todos ("
+    "  id      INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  user_id TEXT    NOT NULL,"
+    "  title   TEXT    NOT NULL,"
+    "  done    INTEGER NOT NULL DEFAULT 0,"
+    "  created TEXT    NOT NULL DEFAULT (datetime('now'))"
+    ")";
 
+/* ── jwt_sign ────────────────────────────────────────────────────────── */
+static char *_b64url(const unsigned char *src, size_t len) {
+    static const char T[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    char *buf = malloc(4 * ((len + 2) / 3) + 1);
+    if (!buf) return NULL;
+    size_t j = 0;
+    for (size_t i = 0; i < len; i += 3) {
+        unsigned char a = src[i];
+        unsigned char b = i+1 < len ? src[i+1] : 0;
+        unsigned char c = i+2 < len ? src[i+2] : 0;
+        buf[j++] = T[a >> 2];
+        buf[j++] = T[((a & 3) << 4) | (b >> 4)];
+        buf[j++] = i+1 < len ? T[((b & 0xf) << 2) | (c >> 6)] : '=';
+        buf[j++] = i+2 < len ? T[c & 0x3f] : '=';
+    }
+    buf[j] = '\0';
+    for (size_t k = 0; buf[k]; k++) {
+        if      (buf[k] == '+') buf[k] = '-';
+        else if (buf[k] == '/') buf[k] = '_';
+        else if (buf[k] == '=') { buf[k] = '\0'; break; }
+    }
+    return buf;
+}
+
+/* Signs an HS256 JWT. Returns malloc'd string — caller must free(). */
+static char *jwt_sign(const char *sub, const char *secret, int ttl_sec) {
+    long now = (long)time(NULL);
+    char payload[256];
+    snprintf(payload, sizeof(payload),
+        "{\"sub\":\"%s\",\"iat\":%ld,\"exp\":%ld}", sub, now, now + ttl_sec);
+
+    const char *hdr = "{\"alg\":\"HS256\",\"typ\":\"JWT\"}";
+    char *h = _b64url((const unsigned char *)hdr,     strlen(hdr));
+    char *p = _b64url((const unsigned char *)payload, strlen(payload));
+    if (!h || !p) { free(h); free(p); return NULL; }
+
+    size_t si_len = strlen(h) + 1 + strlen(p);
+    char  *si     = malloc(si_len + 1);
+    snprintf(si, si_len + 1, "%s.%s", h, p);
+
+    unsigned char sig[32]; unsigned int sig_len = 32;
+    HMAC(EVP_sha256(), secret, (int)strlen(secret),
+         (const unsigned char *)si, si_len, sig, &sig_len);
+    char *s = _b64url(sig, sig_len);
+
+    char *tok = malloc(si_len + 1 + strlen(s) + 1);
+    snprintf(tok, si_len + 1 + strlen(s) + 1, "%s.%s", si, s);
+
+    free(h); free(p); free(si); free(s);
+    return tok;
+}
+
+/* ── password hashing (PBKDF2-SHA256) ───────────────────────────────── */
+static void hash_password(const char *password,
+                           const unsigned char salt[16],
+                           unsigned char out[32]) {
+    PKCS5_PBKDF2_HMAC(password, -1, salt, 16, 100000, EVP_sha256(), 32, out);
+}
+
+static const char *jwt_secret(void) {
+    const char *s = getenv("FALCON_JWT_SECRET");
+    return (s && s[0]) ? s : "change-me-in-prod";
+}
+
+/* ── health ──────────────────────────────────────────────────────────── */
 static void health(falcon_ctx *ctx) {
     falcon_json_str(ctx, 200, "{\"status\":\"ok\"}");
 }
 
-/* ── JWT middleware ─────────────────────────────────────────────────── */
-
+/* ── JWT middleware ───────────────────────────────────────────────────── */
 static void jwt_auth(falcon_ctx *ctx, falcon_next_fn next) {
-    static const falcon_mw_jwt_opts opts = { .secret = "change-me-in-prod" };
+    falcon_mw_jwt_opts opts = { .secret = jwt_secret() };
     falcon_mw_jwt_with(ctx, next, &opts);
 }
 
-/* ── callbacks ──────────────────────────────────────────────────────── */
+/* ── auth: signup ────────────────────────────────────────────────────── */
+typedef struct { char username[128]; } SignupData;
 
+static void cb_signup(falcon_ctx *ctx, falcon_db_result *r, const char *err) {
+    if (err) {
+        falcon_json_str(ctx, 409, "{\"error\":\"username taken\"}");
+        return;
+    }
+    falcon_db_result_free(r);
+
+    SignupData *d = falcon_ctx_get_user_data(ctx);
+    char *token   = jwt_sign(d->username, jwt_secret(), 3600);
+    if (!token) { falcon_json_str(ctx, 500, "{\"error\":\"sign failed\"}"); return; }
+
+    cJSON *resp = cJSON_CreateObject();
+    cJSON_AddStringToObject(resp, "token", token);
+    free(token);
+    falcon_json(ctx, 201, resp);
+}
+
+static void signup(falcon_ctx *ctx) {
+    cJSON *body = falcon_body_json(ctx);
+    if (!body) FALCON_ABORT(ctx, 400, "invalid JSON");
+
+    cJSON *j_user = cJSON_GetObjectItem(body, "username");
+    cJSON *j_pass = cJSON_GetObjectItem(body, "password");
+    if (!cJSON_IsString(j_user) || !j_user->valuestring[0] ||
+        !cJSON_IsString(j_pass) || !j_pass->valuestring[0])
+        FALCON_ABORT(ctx, 400, "username and password required");
+
+    unsigned char salt[16], hash[32];
+    RAND_bytes(salt, sizeof(salt));
+    hash_password(j_pass->valuestring, salt, hash);
+
+    char salt_hex[33], hash_hex[65];
+    for (int i = 0; i < 16; i++) sprintf(salt_hex + i*2, "%02x", salt[i]);
+    for (int i = 0; i < 32; i++) sprintf(hash_hex + i*2, "%02x", hash[i]);
+    salt_hex[32] = hash_hex[64] = '\0';
+
+    SignupData *d = malloc(sizeof(*d));
+    strncpy(d->username, j_user->valuestring, sizeof(d->username) - 1);
+    d->username[sizeof(d->username) - 1] = '\0';
+    falcon_ctx_set_user_data(ctx, d, free);
+
+    falcon_db_conn *conn = falcon_db_acquire(ctx);
+    if (!conn) FALCON_ABORT(ctx, 503, "busy");
+
+    falcon_db_async_query(ctx, conn, cb_signup,
+        "INSERT INTO users (username, salt_hex, hash_hex) VALUES (?, ?, ?)",
+        FALCON_DB_TEXT, j_user->valuestring,
+        FALCON_DB_TEXT, salt_hex,
+        FALCON_DB_TEXT, hash_hex,
+        FALCON_DB_END);
+}
+
+/* ── auth: login ─────────────────────────────────────────────────────── */
+typedef struct { char username[128]; char password[128]; } LoginData;
+
+static void cb_login(falcon_ctx *ctx, falcon_db_result *r, const char *err) {
+    LoginData *d = falcon_ctx_get_user_data(ctx);
+
+    if (err || falcon_db_result_row_count(r) == 0) {
+        falcon_db_result_free(r);
+        falcon_json_str(ctx, 401, "{\"error\":\"invalid credentials\"}");
+        return;
+    }
+
+    /* Copy strings before freeing result */
+    char username[128], salt_hex[33], hash_hex[65];
+    const char *_u = falcon_db_result_get(r, 0, 0);
+    const char *_s = falcon_db_result_get(r, 0, 1);
+    const char *_h = falcon_db_result_get(r, 0, 2);
+    strncpy(username, _u ? _u : "", sizeof(username) - 1);
+    strncpy(salt_hex, _s ? _s : "", sizeof(salt_hex) - 1);
+    strncpy(hash_hex, _h ? _h : "", sizeof(hash_hex) - 1);
+    falcon_db_result_free(r);
+
+    unsigned char salt[16], expected[32], actual[32];
+    for (int i = 0; i < 16; i++) sscanf(salt_hex + i*2, "%02hhx", &salt[i]);
+    for (int i = 0; i < 32; i++) sscanf(hash_hex + i*2, "%02hhx", &expected[i]);
+    hash_password(d->password, salt, actual);
+
+    if (memcmp(actual, expected, 32) != 0) {
+        falcon_json_str(ctx, 401, "{\"error\":\"invalid credentials\"}");
+        return;
+    }
+
+    char *token = jwt_sign(username, jwt_secret(), 3600);
+    if (!token) { falcon_json_str(ctx, 500, "{\"error\":\"sign failed\"}"); return; }
+
+    cJSON *resp = cJSON_CreateObject();
+    cJSON_AddStringToObject(resp, "token", token);
+    free(token);
+    falcon_json(ctx, 200, resp);
+}
+
+static void login(falcon_ctx *ctx) {
+    cJSON *body = falcon_body_json(ctx);
+    if (!body) FALCON_ABORT(ctx, 400, "invalid JSON");
+
+    cJSON *j_user = cJSON_GetObjectItem(body, "username");
+    cJSON *j_pass = cJSON_GetObjectItem(body, "password");
+    if (!cJSON_IsString(j_user) || !cJSON_IsString(j_pass))
+        FALCON_ABORT(ctx, 400, "username and password required");
+
+    LoginData *d = malloc(sizeof(*d));
+    strncpy(d->username, j_user->valuestring, sizeof(d->username) - 1);
+    strncpy(d->password, j_pass->valuestring, sizeof(d->password) - 1);
+    d->username[sizeof(d->username) - 1] = '\0';
+    d->password[sizeof(d->password) - 1] = '\0';
+    falcon_ctx_set_user_data(ctx, d, free);
+
+    falcon_db_conn *conn = falcon_db_acquire(ctx);
+    if (!conn) FALCON_ABORT(ctx, 503, "busy");
+
+    falcon_db_async_query(ctx, conn, cb_login,
+        "SELECT username, salt_hex, hash_hex FROM users WHERE username = ?",
+        FALCON_DB_TEXT, j_user->valuestring,
+        FALCON_DB_END);
+}
+
+/* ── todo callbacks ──────────────────────────────────────────────────── */
 static void cb_list(falcon_ctx *ctx, falcon_db_result *r, const char *err) {
     if (err) { falcon_json_str(ctx, 500, "{\"error\":\"db\"}"); return; }
     cJSON *arr = falcon_db_result_to_json(r);
@@ -2442,11 +2653,11 @@ static void cb_created(falcon_ctx *ctx, falcon_db_result *r, const char *err) {
 static void cb_insert(falcon_ctx *ctx, falcon_db_result *r, const char *err) {
     if (err) { falcon_json_str(ctx, 500, "{\"error\":\"db\"}"); return; }
     falcon_db_result_free(r);
-
     falcon_db_conn *conn = falcon_db_acquire(ctx);
     if (!conn) { falcon_json_str(ctx, 503, "{\"error\":\"busy\"}"); return; }
     falcon_db_async_query(ctx, conn, cb_created,
-        "SELECT id, user_id, title, done, created FROM todos WHERE rowid = last_insert_rowid()",
+        "SELECT id, user_id, title, done, created FROM todos"
+        " WHERE rowid = last_insert_rowid()",
         FALCON_DB_END);
 }
 
@@ -2454,15 +2665,14 @@ static void cb_done(falcon_ctx *ctx, falcon_db_result *r, const char *err) {
     if (err) { falcon_json_str(ctx, 500, "{\"error\":\"db\"}"); return; }
     int affected = falcon_db_result_row_count(r);
     falcon_db_result_free(r);
-    if (affected == 0) { falcon_json_str(ctx, 404, "{\"error\":\"not found\"}"); return; }
+    if (!affected) { falcon_json_str(ctx, 404, "{\"error\":\"not found\"}"); return; }
     falcon_json_str(ctx, 200, "{\"ok\":true}");
 }
 
-/* ── handlers ───────────────────────────────────────────────────────── */
-
+/* ── todo handlers ───────────────────────────────────────────────────── */
 static void list_todos(falcon_ctx *ctx) {
-    cJSON *claims  = falcon_jwt_claims(ctx);
-    cJSON *sub     = cJSON_GetObjectItem(claims, "sub");
+    cJSON *claims = falcon_jwt_claims(ctx);
+    cJSON *sub    = cJSON_GetObjectItem(claims, "sub");
     const char *uid = sub ? sub->valuestring : "";
 
     falcon_db_conn *conn = falcon_db_acquire(ctx);
@@ -2474,8 +2684,8 @@ static void list_todos(falcon_ctx *ctx) {
 }
 
 static void create_todo(falcon_ctx *ctx) {
-    cJSON *claims  = falcon_jwt_claims(ctx);
-    cJSON *sub     = cJSON_GetObjectItem(claims, "sub");
+    cJSON *claims = falcon_jwt_claims(ctx);
+    cJSON *sub    = cJSON_GetObjectItem(claims, "sub");
     const char *uid = sub ? sub->valuestring : "";
 
     cJSON *body  = falcon_body_json(ctx);
@@ -2495,8 +2705,8 @@ static void create_todo(falcon_ctx *ctx) {
 }
 
 static void delete_todo(falcon_ctx *ctx) {
-    cJSON *claims  = falcon_jwt_claims(ctx);
-    cJSON *sub     = cJSON_GetObjectItem(claims, "sub");
+    cJSON *claims = falcon_jwt_claims(ctx);
+    cJSON *sub    = cJSON_GetObjectItem(claims, "sub");
     const char *uid = sub ? sub->valuestring : "";
     const char *id  = falcon_param(ctx, "id");
 
@@ -2510,10 +2720,8 @@ static void delete_todo(falcon_ctx *ctx) {
         FALCON_DB_END);
 }
 
-/* ── main ───────────────────────────────────────────────────────────── */
-
+/* ── main ────────────────────────────────────────────────────────────── */
 int main(void) {
-    /* DB setup */
     falcon_db_pool *db = falcon_sqlite_open("./todos.db", NULL);
     if (!db) { fprintf(stderr, "Failed to open DB\n"); return 1; }
 
@@ -2524,7 +2732,10 @@ int main(void) {
         falcon_ctx *bctx   = falcon_ctx_alloc(tmp);
         falcon_db_conn *bc = falcon_db_acquire(bctx);
         if (bc) {
-            falcon_db_result *r = falcon_db_query(bc, SCHEMA, FALCON_DB_END);
+            falcon_db_result *r;
+            r = falcon_db_query(bc, SCHEMA_USERS, FALCON_DB_END);
+            falcon_db_result_free(r);
+            r = falcon_db_query(bc, SCHEMA_TODOS, FALCON_DB_END);
             falcon_db_result_free(r);
             falcon_db_release(bc);
         }
@@ -2532,26 +2743,26 @@ int main(void) {
         falcon_app_free(tmp);
     }
 
-    /* App */
     falcon_app *app = falcon_app_new();
     falcon_app_set_db(app, db);
 
     falcon_use(app, falcon_mw_logger);
     falcon_use(app, falcon_mw_cors);
 
-    /* Public routes */
-    falcon_get(app, "/health", health);
+    /* Public — no auth */
+    falcon_get(app,  "/health",      health);
+    falcon_post(app, "/auth/signup", signup);
+    falcon_post(app, "/auth/login",  login);
 
-    /* Protected routes — require JWT */
+    /* Protected — JWT required */
     falcon_router_t *api = falcon_router(app, "/api");
     falcon_router_use(api, jwt_auth);
-    falcon_router_get(api,    "/todos",      list_todos);
-    falcon_router_post(api,   "/todos",      create_todo);
-    falcon_router_delete(api, "/todos/:id",  delete_todo);
+    falcon_router_get(api,    "/todos",     list_todos);
+    falcon_router_post(api,   "/todos",     create_todo);
+    falcon_router_delete(api, "/todos/:id", delete_todo);
 
     const char *port = getenv("PORT");
     if (!port || !port[0]) port = "8080";
-
     fprintf(stderr, "Listening on http://0.0.0.0:%s\n", port);
 
     falcon_serve_opts opts = { .port = port };
@@ -2564,78 +2775,67 @@ int main(void) {
 
 ### Compile and run
 
-Save the code above as `todo_api.c`, then:
-
-**With pkg-config (recommended — works after any install method):**
-
-First, make sure the system DB client libraries are present (they are needed because
-`libfalcon_db.a` bundles all three backends — SQLite, PostgreSQL, MySQL):
-
 ```bash
-# Ubuntu / Debian
+# Install system DB libs (needed because libfalcon_db.a bundles all backends)
 sudo apt install libsqlite3-dev libpq-dev default-libmysqlclient-dev
-```
 
-Then compile:
+# Compile
+gcc -o todo_api todo_api.c $(pkg-config --cflags --libs --static falcon falcon_db)
 
-```bash
-gcc -o todo_api todo_api.c \
-    $(pkg-config --cflags --libs --static falcon falcon_db)
-./todo_api
+# Run
+FALCON_JWT_SECRET=mysecret ./todo_api
 # Listening on http://0.0.0.0:8080
 ```
 
-JWT is part of the core `libfalcon.a` so nothing extra is needed for it.
-
-**Manual flags (if pkg-config is unavailable or you installed from tarball):**
+Manual flags (without pkg-config):
 ```bash
 gcc -o todo_api todo_api.c \
-    -I/usr/local/include \
-    -L/usr/local/lib \
+    -I/usr/local/include -L/usr/local/lib \
     -lfalcon_db -lsqlite3 -lpq -lmysqlclient -lfalcon -lssl -lcrypto
-./todo_api
-```
-
-Link order matters: `falcon_db` before `falcon`, and `falcon` before `ssl`/`crypto`.
-
-**With CMake:**
-```cmake
-cmake_minimum_required(VERSION 3.20)
-project(todo_api C)
-find_package(falcon REQUIRED)
-find_package(SQLite3 REQUIRED)
-add_executable(todo_api todo_api.c)
-target_link_libraries(todo_api PRIVATE falcon::falcon_db SQLite::SQLite3)
-```
-```bash
-cmake -S . -B build && cmake --build build
-./build/todo_api
 ```
 
 ### Try it
 
 ```bash
-# Get a token (generate offline or use a tool like https://jwt.io)
-TOKEN=$(python3 -c "
-import jwt, time
-print(jwt.encode({'sub':'user1','exp':int(time.time())+3600}, 'change-me-in-prod'))
-")
+# 1 — sign up (returns a token immediately)
+curl -s -X POST http://localhost:8080/auth/signup \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"alice","password":"s3cur3"}'
+# {"token":"eyJ..."}
 
-# List todos (authenticated)
-curl -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/todos
+# 2 — log in (use this after restarts, when the token from signup expires)
+TOKEN=$(curl -s -X POST http://localhost:8080/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"alice","password":"s3cur3"}' \
+  | python3 -c "import sys,json; print(json.load(sys.stdin)['token'])")
 
-# Create a todo
-curl -X POST http://localhost:8080/api/todos \
+# 3 — list todos (empty at first)
+curl -s -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/todos
+# []
+
+# 4 — create a todo
+curl -s -X POST http://localhost:8080/api/todos \
   -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
+  -H 'Content-Type: application/json' \
   -d '{"title":"Buy milk"}'
+# {"id":1,"user_id":"alice","title":"Buy milk","done":0,"created":"..."}
 
-# Delete a todo
-curl -X DELETE http://localhost:8080/api/todos/1 \
+# 5 — list again
+curl -s -H "Authorization: Bearer $TOKEN" http://localhost:8080/api/todos
+
+# 6 — delete
+curl -s -X DELETE http://localhost:8080/api/todos/1 \
   -H "Authorization: Bearer $TOKEN"
+# {"ok":true}
 
-# Without token → 401
-curl http://localhost:8080/api/todos
+# 7 — wrong password → 401
+curl -s -X POST http://localhost:8080/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"alice","password":"wrong"}'
+# {"error":"invalid credentials"}
+
+# 8 — no token → 401
+curl -s http://localhost:8080/api/todos
 ```
 
 ---
