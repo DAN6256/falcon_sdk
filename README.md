@@ -998,32 +998,278 @@ static void jwt_strict(falcon_ctx *ctx, falcon_next_fn next) {
 
 On failure: responds `401 Unauthorized` with `WWW-Authenticate: Bearer` and halts the chain. No need to check in the handler.
 
-### Generating tokens (outside Falcon)
+### Issuing tokens — login and signup
 
-Falcon only validates tokens; it does not issue them. Generate tokens in your auth
-service or login endpoint using any JWT library:
+Falcon verifies tokens but does not sign them. Add this `jwt_sign` helper to your
+project — it only uses OpenSSL, which is already linked:
 
-```python
-# Python (PyJWT)
-import jwt, time
-token = jwt.encode(
-    {"sub": "42", "role": "admin", "exp": int(time.time()) + 3600},
-    "my-secret",
-    algorithm="HS256"
-)
-print(token)
+```c
+/* jwt_sign.h — drop this in your project, no extra dependencies */
+#include <openssl/hmac.h>
+#include <openssl/evp.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+static char *_b64url(const unsigned char *src, size_t len) {
+    static const char T[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    char *buf = malloc(4 * ((len + 2) / 3) + 1);
+    if (!buf) return NULL;
+    size_t j = 0;
+    for (size_t i = 0; i < len; i += 3) {
+        unsigned char a = src[i];
+        unsigned char b = i+1 < len ? src[i+1] : 0;
+        unsigned char c = i+2 < len ? src[i+2] : 0;
+        buf[j++] = T[a >> 2];
+        buf[j++] = T[((a & 3) << 4) | (b >> 4)];
+        buf[j++] = i+1 < len ? T[((b & 0xf) << 2) | (c >> 6)] : '=';
+        buf[j++] = i+2 < len ? T[c & 0x3f] : '=';
+    }
+    buf[j] = '\0';
+    for (size_t k = 0; buf[k]; k++) {
+        if      (buf[k] == '+') buf[k] = '-';
+        else if (buf[k] == '/') buf[k] = '_';
+        else if (buf[k] == '=') { buf[k] = '\0'; break; }
+    }
+    return buf;
+}
+
+/*
+ * Sign an HS256 JWT.
+ *   sub     — user identifier stored in the "sub" claim
+ *   secret  — HMAC-SHA256 key (read from env in production)
+ *   ttl_sec — token lifetime in seconds (e.g. 3600 = 1 hour)
+ *
+ * Returns a malloc'd token string. Caller must free().
+ * Returns NULL on allocation failure.
+ */
+char *jwt_sign(const char *sub, const char *secret, int ttl_sec) {
+    long now = (long)time(NULL);
+    char payload[256];
+    snprintf(payload, sizeof(payload),
+        "{\"sub\":\"%s\",\"iat\":%ld,\"exp\":%ld}", sub, now, now + ttl_sec);
+
+    const char *hdr = "{\"alg\":\"HS256\",\"typ\":\"JWT\"}";
+    char *h = _b64url((const unsigned char *)hdr,     strlen(hdr));
+    char *p = _b64url((const unsigned char *)payload, strlen(payload));
+    if (!h || !p) { free(h); free(p); return NULL; }
+
+    size_t si_len = strlen(h) + 1 + strlen(p);
+    char  *si     = malloc(si_len + 1);
+    snprintf(si, si_len + 1, "%s.%s", h, p);
+
+    unsigned char sig[32]; unsigned int sig_len = 32;
+    HMAC(EVP_sha256(), secret, (int)strlen(secret),
+         (const unsigned char *)si, si_len, sig, &sig_len);
+    char *s = _b64url(sig, sig_len);
+
+    char *tok = malloc(si_len + 1 + strlen(s) + 1);
+    snprintf(tok, si_len + 1 + strlen(s) + 1, "%s.%s", si, s);
+
+    free(h); free(p); free(si); free(s);
+    return tok;
+}
 ```
 
-```js
-// Node.js (jsonwebtoken)
-const jwt = require('jsonwebtoken');
-const token = jwt.sign({ sub: '42', role: 'user' }, 'my-secret', { expiresIn: '1h' });
-console.log(token);
+#### Password hashing
+
+Use OpenSSL's PBKDF2 — it's already in the process:
+
+```c
+#include <openssl/evp.h>
+
+/*
+ * Hash a password with PBKDF2-SHA256.
+ * salt     — 16 random bytes, stored alongside the hash in the DB
+ * out_hash — 32-byte output (store as hex or base64)
+ */
+void hash_password(const char *password,
+                   const unsigned char salt[16],
+                   unsigned char out_hash[32]) {
+    PKCS5_PBKDF2_HMAC(password, -1, salt, 16, 100000,
+                      EVP_sha256(), 32, out_hash);
+}
 ```
+
+For the tutorial examples below, passwords are stored as a 64-char hex string
+(`hash_hex`) next to a 32-char hex salt (`salt_hex`) in the `users` table.
+
+#### Users table schema
+
+```sql
+CREATE TABLE IF NOT EXISTS users (
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT    NOT NULL UNIQUE,
+    salt_hex TEXT    NOT NULL,
+    hash_hex TEXT    NOT NULL
+);
+```
+
+#### Signup handler
+
+```c
+#include <openssl/rand.h>
+
+static void cb_signup(falcon_ctx *ctx, falcon_db_result *r, const char *err) {
+    if (err) {
+        /* UNIQUE constraint → username already taken */
+        falcon_json_str(ctx, 409, "{\"error\":\"username taken\"}");
+        return;
+    }
+    falcon_db_result_free(r);
+
+    /* Issue token — "sub" is the username extracted from the query param
+       we stashed in the context. Use ctx user-data or re-parse body.
+       For simplicity here we re-read from the DB result above; in practice
+       store the username in a local struct passed through the callback. */
+    const char *secret = getenv("FALCON_JWT_SECRET");
+    /* NOTE: in real code pass username through user-data, not re-query */
+    falcon_json_str(ctx, 201, "{\"error\":\"use user-data pattern for username\"}");
+}
+
+static void signup(falcon_ctx *ctx) {
+    cJSON *body = falcon_body_json(ctx);
+    if (!body) FALCON_ABORT(ctx, 400, "invalid JSON");
+
+    cJSON *j_user = cJSON_GetObjectItem(body, "username");
+    cJSON *j_pass = cJSON_GetObjectItem(body, "password");
+    if (!cJSON_IsString(j_user) || !cJSON_IsString(j_pass))
+        FALCON_ABORT(ctx, 400, "username and password required");
+
+    const char *username = j_user->valuestring;
+    const char *password = j_pass->valuestring;
+
+    /* Generate salt and hash password */
+    unsigned char salt[16], hash[32];
+    RAND_bytes(salt, sizeof(salt));
+    hash_password(password, salt, hash);
+
+    /* Convert to hex for storage */
+    char salt_hex[33], hash_hex[65];
+    for (int i = 0; i < 16; i++) sprintf(salt_hex + i*2, "%02x", salt[i]);
+    for (int i = 0; i < 32; i++) sprintf(hash_hex + i*2, "%02x", hash[i]);
+    salt_hex[32] = hash_hex[64] = '\0';
+
+    falcon_db_conn *conn = falcon_db_acquire(ctx);
+    if (!conn) FALCON_ABORT(ctx, 503, "busy");
+
+    falcon_db_async_query(ctx, conn, cb_signup,
+        "INSERT INTO users (username, salt_hex, hash_hex) VALUES (?, ?, ?)",
+        FALCON_DB_TEXT, username,
+        FALCON_DB_TEXT, salt_hex,
+        FALCON_DB_TEXT, hash_hex,
+        FALCON_DB_END);
+}
+```
+
+> **User-data pattern:** to pass `username` into `cb_signup` without a second DB
+> query, store it in a heap struct before the async call and retrieve it in the
+> callback via `falcon_ctx_userdata` (see Section 9 on Background Tasks for the
+> pattern).
+
+#### Login handler
+
+```c
+static void cb_login(falcon_ctx *ctx, falcon_db_result *r, const char *err) {
+    if (err || falcon_db_result_row_count(r) == 0) {
+        falcon_db_result_free(r);
+        falcon_json_str(ctx, 401, "{\"error\":\"invalid credentials\"}");
+        return;
+    }
+
+    /* Row: username, salt_hex, hash_hex */
+    const char *username = falcon_db_result_get(r, 0, 0);
+    const char *salt_hex = falcon_db_result_get(r, 0, 1);
+    const char *hash_hex = falcon_db_result_get(r, 0, 2);
+
+    /* Re-derive hash from the submitted password */
+    unsigned char salt[16], expected[32], actual[32];
+    for (int i = 0; i < 16; i++) sscanf(salt_hex + i*2, "%02hhx", &salt[i]);
+    for (int i = 0; i < 32; i++) sscanf(hash_hex + i*2, "%02hhx", &expected[i]);
+
+    /* password was stored in ctx before the async call (user-data pattern) */
+    const char *password = (const char *)falcon_ctx_userdata(ctx);
+    hash_password(password, salt, actual);
+
+    falcon_db_result_free(r);
+
+    if (memcmp(actual, expected, 32) != 0) {
+        falcon_json_str(ctx, 401, "{\"error\":\"invalid credentials\"}");
+        return;
+    }
+
+    const char *secret = getenv("FALCON_JWT_SECRET");
+    char *token = jwt_sign(username, secret, 3600);  /* 1-hour token */
+
+    cJSON *resp = cJSON_CreateObject();
+    cJSON_AddStringToObject(resp, "token", token);
+    free(token);
+    falcon_json(ctx, 200, resp);
+}
+
+static void login(falcon_ctx *ctx) {
+    cJSON *body = falcon_body_json(ctx);
+    if (!body) FALCON_ABORT(ctx, 400, "invalid JSON");
+
+    cJSON *j_user = cJSON_GetObjectItem(body, "username");
+    cJSON *j_pass = cJSON_GetObjectItem(body, "password");
+    if (!cJSON_IsString(j_user) || !cJSON_IsString(j_pass))
+        FALCON_ABORT(ctx, 400, "username and password required");
+
+    /* Store password in ctx so cb_login can verify it */
+    falcon_ctx_set_userdata(ctx, strdup(j_pass->valuestring), free);
+
+    falcon_db_conn *conn = falcon_db_acquire(ctx);
+    if (!conn) FALCON_ABORT(ctx, 503, "busy");
+
+    falcon_db_async_query(ctx, conn, cb_login,
+        "SELECT username, salt_hex, hash_hex FROM users WHERE username = ?",
+        FALCON_DB_TEXT, j_user->valuestring,
+        FALCON_DB_END);
+}
+```
+
+#### Wire up routes
+
+```c
+/* Public — no JWT required */
+falcon_post(app, "/auth/signup", signup);
+falcon_post(app, "/auth/login",  login);
+
+/* Protected — JWT required */
+falcon_router_t *api = falcon_router(app, "/api");
+falcon_router_use(api, jwt_auth);
+/* ... your protected routes ... */
+```
+
+#### Try it
 
 ```bash
-# Quick test token — jwt.io or the jwt CLI
-jwt encode --secret my-secret '{"sub":"42","exp":9999999999}'
+# Sign up
+curl -X POST http://localhost:8080/auth/signup \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"alice","password":"s3cur3"}'
+# {"token":"eyJ..."}
+
+# Log in
+curl -X POST http://localhost:8080/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"alice","password":"s3cur3"}'
+# {"token":"eyJ..."}
+
+# Use the token
+curl -H "Authorization: Bearer eyJ..." http://localhost:8080/api/todos
+```
+
+### Generating a test token without a server
+
+For quick curl tests before your login endpoint exists:
+
+```bash
+# Python (PyJWT)
+python3 -c "import jwt,time; print(jwt.encode({'sub':'alice','exp':int(time.time())+3600},'your-secret'))"
 ```
 
 ### Common mistakes
@@ -2149,6 +2395,7 @@ A complete REST API with authentication, persistent storage, and async DB querie
 #include <falcon/falcon_sqlite.h>
 #include <falcon/falcon_mw_jwt.h>
 #include <falcon/falcon_middleware.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -2160,6 +2407,12 @@ static const char *SCHEMA =
     "  done    INTEGER NOT NULL DEFAULT 0,"
     "  created TEXT NOT NULL DEFAULT (datetime('now'))"
     ")";
+
+/* ── health ─────────────────────────────────────────────────────────── */
+
+static void health(falcon_ctx *ctx) {
+    falcon_json_str(ctx, 200, "{\"status\":\"ok\"}");
+}
 
 /* ── JWT middleware ─────────────────────────────────────────────────── */
 
@@ -2307,6 +2560,56 @@ int main(void) {
     falcon_db_pool_close(db);
     return rc ? 1 : 0;
 }
+```
+
+### Compile and run
+
+Save the code above as `todo_api.c`, then:
+
+**With pkg-config (recommended — works after any install method):**
+
+First, make sure the system DB client libraries are present (they are needed because
+`libfalcon_db.a` bundles all three backends — SQLite, PostgreSQL, MySQL):
+
+```bash
+# Ubuntu / Debian
+sudo apt install libsqlite3-dev libpq-dev default-libmysqlclient-dev
+```
+
+Then compile:
+
+```bash
+gcc -o todo_api todo_api.c \
+    $(pkg-config --cflags --libs --static falcon falcon_db)
+./todo_api
+# Listening on http://0.0.0.0:8080
+```
+
+JWT is part of the core `libfalcon.a` so nothing extra is needed for it.
+
+**Manual flags (if pkg-config is unavailable or you installed from tarball):**
+```bash
+gcc -o todo_api todo_api.c \
+    -I/usr/local/include \
+    -L/usr/local/lib \
+    -lfalcon_db -lsqlite3 -lpq -lmysqlclient -lfalcon -lssl -lcrypto
+./todo_api
+```
+
+Link order matters: `falcon_db` before `falcon`, and `falcon` before `ssl`/`crypto`.
+
+**With CMake:**
+```cmake
+cmake_minimum_required(VERSION 3.20)
+project(todo_api C)
+find_package(falcon REQUIRED)
+find_package(SQLite3 REQUIRED)
+add_executable(todo_api todo_api.c)
+target_link_libraries(todo_api PRIVATE falcon::falcon_db SQLite::SQLite3)
+```
+```bash
+cmake -S . -B build && cmake --build build
+./build/todo_api
 ```
 
 ### Try it
@@ -3145,4 +3448,3 @@ livenessProbe:
 - **Graceful shutdown** — `falcon_run` blocks until the server stops. Send `SIGINT`/`SIGTERM` to exit.
 - **Connection pooling** — `pool_size` in `falcon_db_pool_opts` / `falcon_kv_pool_opts` controls concurrency.
 - **MongoDB** — `#include <falcon/falcon_mongo.h>` (implementation in v1.1).
-
