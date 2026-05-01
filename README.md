@@ -916,7 +916,117 @@ static void my_handler(falcon_ctx *ctx) {
 
 ---
 
-## 8. JWT Authentication
+## 8. Model System — Struct ↔ JSON Mapping
+
+`falcon_model.h` eliminates the `cJSON_CreateObject` / `cJSON_AddStringToObject`
+boilerplate. Define your fields once; get the struct, JSON serializer,
+deserializer, and validator for free.
+
+```c
+#include <falcon/falcon_model.h>
+```
+
+### Defining a model
+
+```c
+#define TODO_FIELDS(F)                  \
+    F(INT,  id,    "id",    0)          \
+    F(STR,  title, "title", 1, 256)     \
+    F(BOOL, done,  "done",  0)
+
+FALCON_MODEL(Todo, TODO_FIELDS)
+```
+
+This generates:
+
+```c
+typedef struct {
+    int  id;
+    char title[256];
+    int  done;
+    uint32_t _fields_set;   /* bitmask: bit N set = field N was present in JSON input */
+} Todo;
+
+cJSON *Todo_to_json  (const Todo *m);
+int    Todo_from_json(const cJSON *j, Todo *out, char *errbuf, size_t errsz);
+int    Todo_validate (const Todo *m, char *errbuf, size_t errsz);
+```
+
+### Field types
+
+| Macro | C type | JSON type | Extra arg |
+|---|---|---|---|
+| `F(INT, name, "key", req)` | `int` | number | — |
+| `F(INT64, name, "key", req)` | `long long` | number | — |
+| `F(DOUBLE, name, "key", req)` | `double` | number | — |
+| `F(BOOL, name, "key", req)` | `int` | boolean | — |
+| `F(STR, name, "key", req, maxlen)` | `char[maxlen]` | string | max length |
+
+`req=1` means required: `from_json` returns 0 with an error message if absent.
+`req=0` means optional: absent fields leave the C field zero-initialized.
+
+### Parsing a request body
+
+```c
+static void create_todo(falcon_ctx *ctx) {
+    FALCON_PARSE_BODY(ctx, Todo, body);
+    /* body.title is populated and validated — or 400 was already sent */
+
+    Todo todo = { .id = next_id(), .done = 0 };
+    strncpy(todo.title, body.title, sizeof(todo.title) - 1);
+    FALCON_SEND_MODEL(ctx, 201, &todo, Todo);
+}
+```
+
+`FALCON_PARSE_BODY(ctx, Type, varname)` expands to:
+1. Parse `falcon_body_json(ctx)` into a `Type varname`
+2. Validate required fields
+3. On any error: send `400` with the error message and `return`
+
+### Sending a response
+
+```c
+FALCON_SEND_MODEL(ctx, 200, &todo, Todo);
+/* equivalent to: cJSON *j = Todo_to_json(&todo); falcon_json(ctx, 200, j); */
+```
+
+For arrays:
+
+```c
+FALCON_SEND_MODEL_ARRAY(ctx, 200, todos, count, Todo);
+```
+
+### Manual serialization
+
+```c
+cJSON *j = Todo_to_json(&todo);
+cJSON_AddStringToObject(j, "extra_field", "value");  /* augment before sending */
+falcon_json(ctx, 200, j);
+```
+
+### Tracking which fields were supplied (PATCH semantics)
+
+`_fields_set` is a bitmask set by `from_json`. Bit N corresponds to field N in
+definition order (0-indexed). Useful for PATCH endpoints where you only want to
+update supplied fields:
+
+```c
+#define TODO_FIELDS(F) \
+    F(STR,  title, "title", 0, 256)   /* bit 0 */ \
+    F(BOOL, done,  "done",  0)        /* bit 1 */
+
+FALCON_MODEL(TodoPatch, TODO_FIELDS)
+
+static void patch_todo(falcon_ctx *ctx) {
+    FALCON_PARSE_BODY(ctx, TodoPatch, patch);
+    if (patch._fields_set & (1u << 0)) { /* title was supplied */ }
+    if (patch._fields_set & (1u << 1)) { /* done was supplied  */ }
+}
+```
+
+---
+
+## 9. JWT Authentication
 
 Include `<falcon/falcon_mw_jwt.h>` (links against OpenSSL, which is always present).
 
@@ -1000,135 +1110,60 @@ On failure: responds `401 Unauthorized` with `WWW-Authenticate: Bearer` and halt
 
 ### Issuing tokens — login and signup
 
-Falcon verifies tokens but does not sign them. Add this `jwt_sign` helper to your
-project — it only uses OpenSSL, which is already linked:
+Include `<falcon/falcon_auth.h>` for password hashing and JWT signing. These
+utilities are part of the `falcon` library — no extra dependencies.
 
 ```c
-/* jwt_sign.h — drop this in your project, no extra dependencies */
-#include <openssl/hmac.h>
-#include <openssl/evp.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <time.h>
-
-static char *_b64url(const unsigned char *src, size_t len) {
-    static const char T[] =
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    char *buf = malloc(4 * ((len + 2) / 3) + 1);
-    if (!buf) return NULL;
-    size_t j = 0;
-    for (size_t i = 0; i < len; i += 3) {
-        unsigned char a = src[i];
-        unsigned char b = i+1 < len ? src[i+1] : 0;
-        unsigned char c = i+2 < len ? src[i+2] : 0;
-        buf[j++] = T[a >> 2];
-        buf[j++] = T[((a & 3) << 4) | (b >> 4)];
-        buf[j++] = i+1 < len ? T[((b & 0xf) << 2) | (c >> 6)] : '=';
-        buf[j++] = i+2 < len ? T[c & 0x3f] : '=';
-    }
-    buf[j] = '\0';
-    for (size_t k = 0; buf[k]; k++) {
-        if      (buf[k] == '+') buf[k] = '-';
-        else if (buf[k] == '/') buf[k] = '_';
-        else if (buf[k] == '=') { buf[k] = '\0'; break; }
-    }
-    return buf;
-}
-
-/*
- * Sign an HS256 JWT.
- *   sub     — user identifier stored in the "sub" claim
- *   secret  — HMAC-SHA256 key (read from env in production)
- *   ttl_sec — token lifetime in seconds (e.g. 3600 = 1 hour)
- *
- * Returns a malloc'd token string. Caller must free().
- * Returns NULL on allocation failure.
- */
-char *jwt_sign(const char *sub, const char *secret, int ttl_sec) {
-    long now = (long)time(NULL);
-    char payload[256];
-    snprintf(payload, sizeof(payload),
-        "{\"sub\":\"%s\",\"iat\":%ld,\"exp\":%ld}", sub, now, now + ttl_sec);
-
-    const char *hdr = "{\"alg\":\"HS256\",\"typ\":\"JWT\"}";
-    char *h = _b64url((const unsigned char *)hdr,     strlen(hdr));
-    char *p = _b64url((const unsigned char *)payload, strlen(payload));
-    if (!h || !p) { free(h); free(p); return NULL; }
-
-    size_t si_len = strlen(h) + 1 + strlen(p);
-    char  *si     = malloc(si_len + 1);
-    snprintf(si, si_len + 1, "%s.%s", h, p);
-
-    unsigned char sig[32]; unsigned int sig_len = 32;
-    HMAC(EVP_sha256(), secret, (int)strlen(secret),
-         (const unsigned char *)si, si_len, sig, &sig_len);
-    char *s = _b64url(sig, sig_len);
-
-    char *tok = malloc(si_len + 1 + strlen(s) + 1);
-    snprintf(tok, si_len + 1 + strlen(s) + 1, "%s.%s", si, s);
-
-    free(h); free(p); free(si); free(s);
-    return tok;
-}
+#include <falcon/falcon_auth.h>
 ```
 
-#### Password hashing
-
-Use OpenSSL's PBKDF2 — it's already in the process:
-
-```c
-#include <openssl/evp.h>
-
-/*
- * Hash a password with PBKDF2-SHA256.
- * salt     — 16 random bytes, stored alongside the hash in the DB
- * out_hash — 32-byte output (store as hex or base64)
- */
-void hash_password(const char *password,
-                   const unsigned char salt[16],
-                   unsigned char out_hash[32]) {
-    PKCS5_PBKDF2_HMAC(password, -1, salt, 16, 100000,
-                      EVP_sha256(), 32, out_hash);
-}
-```
-
-For the tutorial examples below, passwords are stored as a 64-char hex string
-(`hash_hex`) next to a 32-char hex salt (`salt_hex`) in the `users` table.
+**Key design rule:** signup creates the account and returns user data. Login
+authenticates and returns the token. Conflating them confuses account creation
+with session issuance — a user who signs up hasn't proven their password yet.
 
 #### Users table schema
 
 ```sql
 CREATE TABLE IF NOT EXISTS users (
-    id       INTEGER PRIMARY KEY AUTOINCREMENT,
-    username TEXT    NOT NULL UNIQUE,
-    salt_hex TEXT    NOT NULL,
-    hash_hex TEXT    NOT NULL
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    username      TEXT    NOT NULL UNIQUE,
+    password_hash TEXT    NOT NULL   -- stored as "PBKDF2:<iter>:<salt_hex>:<hash_hex>"
 );
 ```
 
-#### Signup handler
+#### Signup handler — returns user data, not a token
 
 ```c
-#include <openssl/rand.h>
-
 typedef struct { char username[128]; } SignupCtx;
 
 static void cb_signup(falcon_ctx *ctx, falcon_db_result *r, const char *err) {
     if (err) {
-        falcon_json_str(ctx, 409, "{\"error\":\"username taken\"}");
+        /* UNIQUE constraint → duplicate username */
+        falcon_json_str(ctx, 409, "{\"error\":\"username already taken\"}");
         return;
     }
+
+    SignupCtx *sc = falcon_ctx_get_user_data(ctx);
+
+    /* Get the auto-assigned id from the last insert */
+    falcon_db_conn *conn2 = falcon_db_acquire(ctx);
+    if (!conn2) {
+        falcon_db_result_free(r);
+        falcon_json_str(ctx, 503, "{\"error\":\"busy\"}");
+        return;
+    }
+    falcon_db_result *id_r = falcon_db_query(conn2,
+        "SELECT id FROM users WHERE username = ?",
+        FALCON_DB_TEXT, sc->username, FALCON_DB_END);
+    falcon_db_release(conn2);
     falcon_db_result_free(r);
 
-    SignupCtx  *sc     = falcon_ctx_get_user_data(ctx);
-    const char *secret = getenv("FALCON_JWT_SECRET");
-    char *token = jwt_sign(sc->username, secret, 3600);
-    if (!token) { falcon_json_str(ctx, 500, "{\"error\":\"sign failed\"}"); return; }
+    int uid = id_r ? atoi(falcon_db_result_get(id_r, 0, 0) ?: "0") : 0;
+    falcon_db_result_free(id_r);
 
     cJSON *resp = cJSON_CreateObject();
-    cJSON_AddStringToObject(resp, "token", token);
-    free(token);
+    cJSON_AddNumberToObject(resp, "id",       uid);
+    cJSON_AddStringToObject(resp, "username", sc->username);
     falcon_json(ctx, 201, resp);
 }
 
@@ -1142,38 +1177,36 @@ static void signup(falcon_ctx *ctx) {
         !cJSON_IsString(j_pass) || !j_pass->valuestring[0])
         FALCON_ABORT(ctx, 400, "username and password required");
 
-    unsigned char salt[16], hash[32];
-    RAND_bytes(salt, sizeof(salt));
-    hash_password(j_pass->valuestring, salt, hash);
+    /* Hash the password — returns "PBKDF2:<iter>:<salt_hex>:<hash_hex>" */
+    char *hash = falcon_password_hash(j_pass->valuestring);
+    if (!hash) FALCON_ABORT(ctx, 500, "server error");
 
-    char salt_hex[33], hash_hex[65];
-    for (int i = 0; i < 16; i++) sprintf(salt_hex + i*2, "%02x", salt[i]);
-    for (int i = 0; i < 32; i++) sprintf(hash_hex + i*2, "%02x", hash[i]);
-    salt_hex[32] = hash_hex[64] = '\0';
-
-    /* Store username so cb_signup can include it in the JWT */
+    /* Store username for the callback (body JSON is request-scoped, not safe
+     * to hold a pointer across an async boundary if body gets modified) */
     SignupCtx *sc = malloc(sizeof(*sc));
     strncpy(sc->username, j_user->valuestring, sizeof(sc->username) - 1);
     sc->username[sizeof(sc->username) - 1] = '\0';
     falcon_ctx_set_user_data(ctx, sc, free);
 
     falcon_db_conn *conn = falcon_db_acquire(ctx);
-    if (!conn) FALCON_ABORT(ctx, 503, "busy");
+    if (!conn) { free(hash); FALCON_ABORT(ctx, 503, "busy"); }
 
-    falcon_db_async_query(ctx, conn, cb_signup,
-        "INSERT INTO users (username, salt_hex, hash_hex) VALUES (?, ?, ?)",
+    int rc = falcon_db_async_query(ctx, conn, cb_signup,
+        "INSERT INTO users (username, password_hash) VALUES (?, ?)",
         FALCON_DB_TEXT, j_user->valuestring,
-        FALCON_DB_TEXT, salt_hex,
-        FALCON_DB_TEXT, hash_hex,
+        FALCON_DB_TEXT, hash,
         FALCON_DB_END);
+    free(hash);
+    if (rc != 0) { falcon_db_release(conn); FALCON_ABORT(ctx, 503, "busy"); }
 }
 ```
 
-> **User-data pattern:** to pass data into an async callback, store a heap-allocated
-> struct before the async call with `falcon_ctx_set_user_data(ctx, ptr, free)` and
-> retrieve it inside the callback with `falcon_ctx_get_user_data(ctx)`.
+> **User-data pattern:** to pass data into an async callback, store a
+> heap-allocated struct before the async call with
+> `falcon_ctx_set_user_data(ctx, ptr, free)` and retrieve it in the callback
+> with `falcon_ctx_get_user_data(ctx)`.
 
-#### Login handler
+#### Login handler — returns the token
 
 ```c
 static void cb_login(falcon_ctx *ctx, falcon_db_result *r, const char *err) {
@@ -1183,27 +1216,21 @@ static void cb_login(falcon_ctx *ctx, falcon_db_result *r, const char *err) {
         return;
     }
 
-    /* Copy strings out before freeing the result */
-    char username[128], salt_hex[33], hash_hex[65];
-    strncpy(username, falcon_db_result_get(r, 0, 0) ?: "", sizeof(username) - 1);
-    strncpy(salt_hex, falcon_db_result_get(r, 0, 1) ?: "", sizeof(salt_hex) - 1);
-    strncpy(hash_hex, falcon_db_result_get(r, 0, 2) ?: "", sizeof(hash_hex) - 1);
+    /* Copy out of the result before freeing it */
+    char username[128], stored_hash[256];
+    strncpy(username,    falcon_db_result_get(r, 0, 0) ?: "", sizeof(username) - 1);
+    strncpy(stored_hash, falcon_db_result_get(r, 0, 1) ?: "", sizeof(stored_hash) - 1);
     falcon_db_result_free(r);
 
-    /* Re-derive hash from the submitted password (body JSON is cached per-request) */
     const char *password = (const char *)falcon_ctx_get_user_data(ctx);
-    unsigned char salt[16], expected[32], actual[32];
-    for (int i = 0; i < 16; i++) sscanf(salt_hex + i*2, "%02hhx", &salt[i]);
-    for (int i = 0; i < 32; i++) sscanf(hash_hex + i*2, "%02hhx", &expected[i]);
-    hash_password(password, salt, actual);
-
-    if (memcmp(actual, expected, 32) != 0) {
+    if (!falcon_password_verify(password, stored_hash)) {
         falcon_json_str(ctx, 401, "{\"error\":\"invalid credentials\"}");
         return;
     }
 
     const char *secret = getenv("FALCON_JWT_SECRET");
-    char *token = jwt_sign(username, secret, 3600);  /* 1-hour token */
+    char *token = falcon_jwt_sign(username, secret, 3600);  /* 1-hour token */
+    if (!token) { falcon_json_str(ctx, 500, "{\"error\":\"sign failed\"}"); return; }
 
     cJSON *resp = cJSON_CreateObject();
     cJSON_AddStringToObject(resp, "token", token);
@@ -1220,14 +1247,15 @@ static void login(falcon_ctx *ctx) {
     if (!cJSON_IsString(j_user) || !cJSON_IsString(j_pass))
         FALCON_ABORT(ctx, 400, "username and password required");
 
-    /* Store password in ctx so cb_login can verify it after the async result arrives */
+    /* Store password for the callback — body JSON is cached per-request but
+     * strdup is safer for async code that may outlive the request object */
     falcon_ctx_set_user_data(ctx, strdup(j_pass->valuestring), free);
 
     falcon_db_conn *conn = falcon_db_acquire(ctx);
     if (!conn) FALCON_ABORT(ctx, 503, "busy");
 
     falcon_db_async_query(ctx, conn, cb_login,
-        "SELECT username, salt_hex, hash_hex FROM users WHERE username = ?",
+        "SELECT username, password_hash FROM users WHERE username = ?",
         FALCON_DB_TEXT, j_user->valuestring,
         FALCON_DB_END);
 }
@@ -1249,13 +1277,13 @@ falcon_router_use(api, jwt_auth);
 #### Try it
 
 ```bash
-# Sign up
+# Sign up → receives user data (not a token)
 curl -X POST http://localhost:8080/auth/signup \
   -H 'Content-Type: application/json' \
   -d '{"username":"alice","password":"s3cur3"}'
-# {"token":"eyJ..."}
+# {"id":1,"username":"alice"}
 
-# Log in
+# Log in → receives the token
 curl -X POST http://localhost:8080/auth/login \
   -H 'Content-Type: application/json' \
   -d '{"username":"alice","password":"s3cur3"}'
@@ -1264,6 +1292,88 @@ curl -X POST http://localhost:8080/auth/login \
 # Use the token
 curl -H "Authorization: Bearer eyJ..." http://localhost:8080/api/todos
 ```
+
+### Async resolver middleware — resolving JWT to a user object
+
+`falcon_mw_jwt` validates the token and stops there. Your handlers still need to
+look up the user from the DB using `falcon_jwt_claims(ctx)`. With
+`falcon_mw_auth_with`, the framework does that lookup for you: handlers call
+`falcon_auth_user(ctx)` and receive the resolved user pointer directly.
+
+```c
+#include <falcon/falcon_auth.h>
+#include <falcon/falcon_db.h>
+
+typedef struct { int id; char username[128]; } User;
+
+/* Step 1 — write the resolver: called after JWT validates, before the handler */
+static void resolve_user(falcon_ctx *ctx, const char *sub,
+                          void *arg, falcon_auth_done_fn done) {
+    (void)arg;
+    falcon_db_conn *conn = falcon_db_acquire(ctx);
+    if (!conn) { done(ctx, NULL); return; }   /* NULL → 401 */
+
+    /* sub is the JWT "sub" claim — we stored username there at login */
+    typedef struct { falcon_db_conn *conn; falcon_auth_done_fn done; } RCtx;
+    RCtx *rc = malloc(sizeof *rc);
+    rc->conn = conn;
+    rc->done = done;
+    falcon_ctx_set_user_data(ctx, rc, free);
+
+    if (falcon_db_async_query(ctx, conn, cb_resolve_user,
+            "SELECT id, username FROM users WHERE username = ?",
+            FALCON_DB_TEXT, sub, FALCON_DB_END) != 0) {
+        falcon_db_release(conn);
+        free(rc);
+        done(ctx, NULL);
+    }
+}
+
+static void cb_resolve_user(falcon_ctx *ctx, falcon_db_result *r, const char *err) {
+    typedef struct { falcon_db_conn *conn; falcon_auth_done_fn done; } RCtx;
+    RCtx *rc = falcon_ctx_get_user_data(ctx);
+
+    if (err || !r || falcon_db_result_row_count(r) == 0) {
+        falcon_db_result_free(r);
+        rc->done(ctx, NULL);   /* user not found → 401 */
+        return;
+    }
+
+    User *u = malloc(sizeof *u);
+    u->id = atoi(falcon_db_result_get(r, 0, 0) ?: "0");
+    strncpy(u->username, falcon_db_result_get(r, 0, 1) ?: "", sizeof(u->username) - 1);
+    falcon_db_result_free(r);
+
+    rc->done(ctx, u);   /* success: u is now accessible via falcon_auth_user(ctx) */
+}
+
+/* Step 2 — register the middleware */
+static void auth_mw(falcon_ctx *ctx, falcon_next_fn next) {
+    static falcon_mw_auth_opts opts = { .resolver = resolve_user };
+    falcon_mw_auth_with(ctx, next, &opts);
+}
+
+/* Step 3 — use in protected handlers */
+static void get_profile(falcon_ctx *ctx) {
+    User *me = falcon_auth_user(ctx);  /* fully resolved — no JWT, no DB call */
+    cJSON *resp = cJSON_CreateObject();
+    cJSON_AddNumberToObject(resp, "id",       me->id);
+    cJSON_AddStringToObject(resp, "username", me->username);
+    free(me);   /* User was malloc'd by the resolver */
+    falcon_json(ctx, 200, resp);
+}
+
+/* Step 4 — wire up */
+falcon_router_t *api = falcon_router(app, "/api");
+falcon_router_use(api, auth_mw);
+falcon_router_get(api, "/profile", get_profile);
+```
+
+> **When to use `falcon_mw_auth_with` vs `falcon_mw_jwt`:**
+> Use `falcon_mw_auth_with` when your handlers need a fully hydrated user object
+> (roles, preferences, etc.) and you want to eliminate per-handler DB boilerplate.
+> Use `falcon_mw_jwt` when you only need the raw claims and don't need a DB lookup
+> for every request (e.g. a stateless microservice verifying tokens issued elsewhere).
 
 ### Generating a test token without a server
 
@@ -1310,7 +1420,7 @@ static void profile(falcon_ctx *ctx) {
 
 ---
 
-## 9. Background Tasks
+## 10. Background Tasks
 
 `falcon_after` schedules a callback to run after the HTTP response has been fully
 sent to the client. The response is already gone — the client is not waiting —
@@ -1405,7 +1515,7 @@ and process it in a separate worker process.
 
 ---
 
-## 10. SQLite Database
+## 11. SQLite Database
 
 SQLite requires no server and stores everything in a single file. It's a great choice
 for development, single-process apps, and read-heavy workloads. Because SQLite allows
@@ -1581,7 +1691,7 @@ static void create_item_tx(falcon_ctx *ctx) {
 
 ---
 
-## 11. PostgreSQL Database
+## 12. PostgreSQL Database
 
 PostgreSQL is the right choice for production: concurrent writes, strong consistency,
 JSONB, full-text search, and proper transactions. Falcon uses `libpq` under the hood.
@@ -1686,7 +1796,7 @@ return rc ? 1 : 0;
 
 ---
 
-## 12. MySQL / MariaDB Database
+## 13. MySQL / MariaDB Database
 
 Falcon's MySQL backend is fully compatible with both MySQL 5.7+, MySQL 8.0, and
 MariaDB 10.4+. The API is identical to SQLite and PostgreSQL.
@@ -1802,7 +1912,7 @@ CREATE TABLE items (
 
 ---
 
-## 13. Redis Key-Value Store
+## 14. Redis Key-Value Store
 
 Redis is for fast, in-memory data: sessions, caches, rate limit counters, pub/sub,
 and ephemeral state that doesn't need durability. Falcon uses `hiredis` under the hood.
@@ -1980,7 +2090,7 @@ static void list_items_cached(falcon_ctx *ctx) {
 
 ---
 
-## 14. TLS / HTTPS
+## 15. TLS / HTTPS
 
 Provide `tls_cert_path` and `tls_key_path` in `falcon_serve_opts`. When TLS is
 configured, Falcon automatically negotiates HTTP/2 via ALPN (`h2`) with HTTP/1.1
@@ -2107,7 +2217,7 @@ Clients that only support HTTP/1.1 continue to work — Falcon falls back automa
 
 ---
 
-## 15. Database Migrations
+## 16. Database Migrations
 
 Falcon's migration runner scans a directory for `.sql` files, applies them in
 alphabetical order, and records each in a `_falcon_migrations` table so files are
@@ -2257,7 +2367,7 @@ static void test_migrations(void **state) {
 
 ---
 
-## 16. Platform Notes
+## 17. Platform Notes
 
 ### macOS
 
@@ -2387,7 +2497,7 @@ package needed at runtime.
 
 ---
 
-## 17. Full Example: Todo API with JWT
+## 18. Full Example: Todo API with JWT
 
 A complete, self-contained REST API: signup, login, JWT auth, and todo CRUD — all in one file.
 Copy it to `todo_api.c`, compile, and run. No other files needed.
@@ -2409,22 +2519,18 @@ Copy it to `todo_api.c`, compile, and run. No other files needed.
 #include <falcon/falcon_db.h>
 #include <falcon/falcon_sqlite.h>
 #include <falcon/falcon_mw_jwt.h>
+#include <falcon/falcon_auth.h>
 #include <falcon/falcon_middleware.h>
-#include <openssl/hmac.h>
-#include <openssl/evp.h>
-#include <openssl/rand.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
 
 /* ── schema ──────────────────────────────────────────────────────────── */
 static const char *SCHEMA_USERS =
     "CREATE TABLE IF NOT EXISTS users ("
-    "  id       INTEGER PRIMARY KEY AUTOINCREMENT,"
-    "  username TEXT    NOT NULL UNIQUE,"
-    "  salt_hex TEXT    NOT NULL,"
-    "  hash_hex TEXT    NOT NULL"
+    "  id            INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  username      TEXT    NOT NULL UNIQUE,"
+    "  password_hash TEXT    NOT NULL"
     ")";
 
 static const char *SCHEMA_TODOS =
@@ -2436,65 +2542,8 @@ static const char *SCHEMA_TODOS =
     "  created TEXT    NOT NULL DEFAULT (datetime('now'))"
     ")";
 
-/* ── jwt_sign ────────────────────────────────────────────────────────── */
-static char *_b64url(const unsigned char *src, size_t len) {
-    static const char T[] =
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    char *buf = malloc(4 * ((len + 2) / 3) + 1);
-    if (!buf) return NULL;
-    size_t j = 0;
-    for (size_t i = 0; i < len; i += 3) {
-        unsigned char a = src[i];
-        unsigned char b = i+1 < len ? src[i+1] : 0;
-        unsigned char c = i+2 < len ? src[i+2] : 0;
-        buf[j++] = T[a >> 2];
-        buf[j++] = T[((a & 3) << 4) | (b >> 4)];
-        buf[j++] = i+1 < len ? T[((b & 0xf) << 2) | (c >> 6)] : '=';
-        buf[j++] = i+2 < len ? T[c & 0x3f] : '=';
-    }
-    buf[j] = '\0';
-    for (size_t k = 0; buf[k]; k++) {
-        if      (buf[k] == '+') buf[k] = '-';
-        else if (buf[k] == '/') buf[k] = '_';
-        else if (buf[k] == '=') { buf[k] = '\0'; break; }
-    }
-    return buf;
-}
-
-/* Signs an HS256 JWT. Returns malloc'd string — caller must free(). */
-static char *jwt_sign(const char *sub, const char *secret, int ttl_sec) {
-    long now = (long)time(NULL);
-    char payload[256];
-    snprintf(payload, sizeof(payload),
-        "{\"sub\":\"%s\",\"iat\":%ld,\"exp\":%ld}", sub, now, now + ttl_sec);
-
-    const char *hdr = "{\"alg\":\"HS256\",\"typ\":\"JWT\"}";
-    char *h = _b64url((const unsigned char *)hdr,     strlen(hdr));
-    char *p = _b64url((const unsigned char *)payload, strlen(payload));
-    if (!h || !p) { free(h); free(p); return NULL; }
-
-    size_t si_len = strlen(h) + 1 + strlen(p);
-    char  *si     = malloc(si_len + 1);
-    snprintf(si, si_len + 1, "%s.%s", h, p);
-
-    unsigned char sig[32]; unsigned int sig_len = 32;
-    HMAC(EVP_sha256(), secret, (int)strlen(secret),
-         (const unsigned char *)si, si_len, sig, &sig_len);
-    char *s = _b64url(sig, sig_len);
-
-    char *tok = malloc(si_len + 1 + strlen(s) + 1);
-    snprintf(tok, si_len + 1 + strlen(s) + 1, "%s.%s", si, s);
-
-    free(h); free(p); free(si); free(s);
-    return tok;
-}
-
-/* ── password hashing (PBKDF2-SHA256) ───────────────────────────────── */
-static void hash_password(const char *password,
-                           const unsigned char salt[16],
-                           unsigned char out[32]) {
-    PKCS5_PBKDF2_HMAC(password, -1, salt, 16, 100000, EVP_sha256(), 32, out);
-}
+/* falcon_auth.h provides falcon_password_hash, falcon_password_verify,
+ * and falcon_jwt_sign — no boilerplate needed here. */
 
 static const char *jwt_secret(void) {
     const char *s = getenv("FALCON_JWT_SECRET");
@@ -2523,12 +2572,23 @@ static void cb_signup(falcon_ctx *ctx, falcon_db_result *r, const char *err) {
     falcon_db_result_free(r);
 
     SignupData *d = falcon_ctx_get_user_data(ctx);
-    char *token   = jwt_sign(d->username, jwt_secret(), 3600);
-    if (!token) { falcon_json_str(ctx, 500, "{\"error\":\"sign failed\"}"); return; }
+
+    /* Fetch the newly created id — conn2 is synchronous (boot-time only,
+     * but signup is low-frequency so one sync query is fine here) */
+    falcon_db_conn *conn2 = falcon_db_acquire(ctx);
+    int uid = 0;
+    if (conn2) {
+        falcon_db_result *ir = falcon_db_query(conn2,
+            "SELECT id FROM users WHERE username = ?",
+            FALCON_DB_TEXT, d->username, FALCON_DB_END);
+        falcon_db_release(conn2);
+        if (ir) { uid = atoi(falcon_db_result_get(ir, 0, 0) ?: "0"); }
+        falcon_db_result_free(ir);
+    }
 
     cJSON *resp = cJSON_CreateObject();
-    cJSON_AddStringToObject(resp, "token", token);
-    free(token);
+    cJSON_AddNumberToObject(resp, "id",       uid);
+    cJSON_AddStringToObject(resp, "username", d->username);
     falcon_json(ctx, 201, resp);
 }
 
@@ -2542,14 +2602,8 @@ static void signup(falcon_ctx *ctx) {
         !cJSON_IsString(j_pass) || !j_pass->valuestring[0])
         FALCON_ABORT(ctx, 400, "username and password required");
 
-    unsigned char salt[16], hash[32];
-    RAND_bytes(salt, sizeof(salt));
-    hash_password(j_pass->valuestring, salt, hash);
-
-    char salt_hex[33], hash_hex[65];
-    for (int i = 0; i < 16; i++) sprintf(salt_hex + i*2, "%02x", salt[i]);
-    for (int i = 0; i < 32; i++) sprintf(hash_hex + i*2, "%02x", hash[i]);
-    salt_hex[32] = hash_hex[64] = '\0';
+    char *hash = falcon_password_hash(j_pass->valuestring);
+    if (!hash) FALCON_ABORT(ctx, 500, "server error");
 
     SignupData *d = malloc(sizeof(*d));
     strncpy(d->username, j_user->valuestring, sizeof(d->username) - 1);
@@ -2557,49 +2611,37 @@ static void signup(falcon_ctx *ctx) {
     falcon_ctx_set_user_data(ctx, d, free);
 
     falcon_db_conn *conn = falcon_db_acquire(ctx);
-    if (!conn) FALCON_ABORT(ctx, 503, "busy");
+    if (!conn) { free(hash); FALCON_ABORT(ctx, 503, "busy"); }
 
-    falcon_db_async_query(ctx, conn, cb_signup,
-        "INSERT INTO users (username, salt_hex, hash_hex) VALUES (?, ?, ?)",
+    int rc = falcon_db_async_query(ctx, conn, cb_signup,
+        "INSERT INTO users (username, password_hash) VALUES (?, ?)",
         FALCON_DB_TEXT, j_user->valuestring,
-        FALCON_DB_TEXT, salt_hex,
-        FALCON_DB_TEXT, hash_hex,
+        FALCON_DB_TEXT, hash,
         FALCON_DB_END);
+    free(hash);
+    if (rc != 0) { falcon_db_release(conn); FALCON_ABORT(ctx, 503, "busy"); }
 }
 
 /* ── auth: login ─────────────────────────────────────────────────────── */
-typedef struct { char username[128]; char password[128]; } LoginData;
-
 static void cb_login(falcon_ctx *ctx, falcon_db_result *r, const char *err) {
-    LoginData *d = falcon_ctx_get_user_data(ctx);
-
     if (err || falcon_db_result_row_count(r) == 0) {
         falcon_db_result_free(r);
         falcon_json_str(ctx, 401, "{\"error\":\"invalid credentials\"}");
         return;
     }
 
-    /* Copy strings before freeing result */
-    char username[128], salt_hex[33], hash_hex[65];
-    const char *_u = falcon_db_result_get(r, 0, 0);
-    const char *_s = falcon_db_result_get(r, 0, 1);
-    const char *_h = falcon_db_result_get(r, 0, 2);
-    strncpy(username, _u ? _u : "", sizeof(username) - 1);
-    strncpy(salt_hex, _s ? _s : "", sizeof(salt_hex) - 1);
-    strncpy(hash_hex, _h ? _h : "", sizeof(hash_hex) - 1);
+    char username[128], stored_hash[256];
+    strncpy(username,    falcon_db_result_get(r, 0, 0) ?: "", sizeof(username) - 1);
+    strncpy(stored_hash, falcon_db_result_get(r, 0, 1) ?: "", sizeof(stored_hash) - 1);
     falcon_db_result_free(r);
 
-    unsigned char salt[16], expected[32], actual[32];
-    for (int i = 0; i < 16; i++) sscanf(salt_hex + i*2, "%02hhx", &salt[i]);
-    for (int i = 0; i < 32; i++) sscanf(hash_hex + i*2, "%02hhx", &expected[i]);
-    hash_password(d->password, salt, actual);
-
-    if (memcmp(actual, expected, 32) != 0) {
+    const char *password = (const char *)falcon_ctx_get_user_data(ctx);
+    if (!falcon_password_verify(password, stored_hash)) {
         falcon_json_str(ctx, 401, "{\"error\":\"invalid credentials\"}");
         return;
     }
 
-    char *token = jwt_sign(username, jwt_secret(), 3600);
+    char *token = falcon_jwt_sign(username, jwt_secret(), 3600);
     if (!token) { falcon_json_str(ctx, 500, "{\"error\":\"sign failed\"}"); return; }
 
     cJSON *resp = cJSON_CreateObject();
@@ -2617,18 +2659,13 @@ static void login(falcon_ctx *ctx) {
     if (!cJSON_IsString(j_user) || !cJSON_IsString(j_pass))
         FALCON_ABORT(ctx, 400, "username and password required");
 
-    LoginData *d = malloc(sizeof(*d));
-    strncpy(d->username, j_user->valuestring, sizeof(d->username) - 1);
-    strncpy(d->password, j_pass->valuestring, sizeof(d->password) - 1);
-    d->username[sizeof(d->username) - 1] = '\0';
-    d->password[sizeof(d->password) - 1] = '\0';
-    falcon_ctx_set_user_data(ctx, d, free);
+    falcon_ctx_set_user_data(ctx, strdup(j_pass->valuestring), free);
 
     falcon_db_conn *conn = falcon_db_acquire(ctx);
     if (!conn) FALCON_ABORT(ctx, 503, "busy");
 
     falcon_db_async_query(ctx, conn, cb_login,
-        "SELECT username, salt_hex, hash_hex FROM users WHERE username = ?",
+        "SELECT username, password_hash FROM users WHERE username = ?",
         FALCON_DB_TEXT, j_user->valuestring,
         FALCON_DB_END);
 }
@@ -2797,13 +2834,13 @@ gcc -o todo_api todo_api.c \
 ### Try it
 
 ```bash
-# 1 — sign up (returns a token immediately)
+# 1 — sign up (returns user data, not a token)
 curl -s -X POST http://localhost:8080/auth/signup \
   -H 'Content-Type: application/json' \
   -d '{"username":"alice","password":"s3cur3"}'
-# {"token":"eyJ..."}
+# {"id":1,"username":"alice"}
 
-# 2 — log in (use this after restarts, when the token from signup expires)
+# 2 — log in to get a token
 TOKEN=$(curl -s -X POST http://localhost:8080/auth/login \
   -H 'Content-Type: application/json' \
   -d '{"username":"alice","password":"s3cur3"}' \
@@ -2840,7 +2877,7 @@ curl -s http://localhost:8080/api/todos
 
 ---
 
-## 18. Cookies
+## 19. Cookies
 
 ### Reading cookies
 
@@ -2901,7 +2938,7 @@ falcon_json_str(ctx, 200, "{\"ok\":true}");
 
 ---
 
-## 19. Form Data and File Uploads
+## 20. Form Data and File Uploads
 
 ### URL-encoded form data
 
@@ -2987,7 +3024,7 @@ Falcon's `falcon_body_raw`.
 
 ---
 
-## 20. Request Validation Patterns
+## 21. Request Validation Patterns
 
 Falcon has no automatic validation layer — that's a feature, not a gap. You
 write explicit C validation, which is fast, readable, and produces exactly the
@@ -3084,7 +3121,7 @@ send_error(ctx, 409, "CONFLICT", "username already taken");
 
 ---
 
-## 21. Custom Error Handling
+## 22. Custom Error Handling
 
 ### Not-found and method-not-allowed
 
@@ -3140,7 +3177,7 @@ falcon_use(app, request_id);
 
 ---
 
-## 22. Static File Serving
+## 23. Static File Serving
 
 Falcon is an API framework. For static files in production, put nginx or a CDN
 in front. For development, you can serve files directly:
@@ -3189,7 +3226,7 @@ For production: serve `/public/` from nginx and point your API prefix at Falcon.
 
 ---
 
-## 23. Testing Your Falcon App
+## 24. Testing Your Falcon App
 
 Falcon uses [CMocka](https://cmocka.org/) for unit tests. The pattern is always
 the same: allocate an app + ctx, call the handler directly, assert on `ctx->res_status`
@@ -3375,7 +3412,7 @@ int main(void) {
 
 ---
 
-## 24. Project Structure
+## 25. Project Structure
 
 For anything beyond a single-file demo, organize your Falcon app like this:
 
@@ -3497,7 +3534,7 @@ void register_routes(falcon_app *app) {
 
 ---
 
-## 25. Deployment
+## 26. Deployment
 
 ### Docker
 
