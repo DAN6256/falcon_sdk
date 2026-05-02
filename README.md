@@ -916,113 +916,162 @@ static void my_handler(falcon_ctx *ctx) {
 
 ---
 
-## 8. Model System — Struct ↔ JSON Mapping
+## 8. JSON Utilities — Builder and Struct Mapping
 
-`falcon_model.h` eliminates the `cJSON_CreateObject` / `cJSON_AddStringToObject`
-boilerplate. Define your fields once; get the struct, JSON serializer,
-deserializer, and validator for free.
+`falcon_json_utils.h` gives you two things: a way to build JSON objects from plain
+function calls (no boilerplate), and a way to serialize and deserialize C structs
+without any macros.
 
 ```c
-#include <falcon/falcon_model.h>
+#include <falcon/falcon_json_utils.h>
 ```
 
-### Defining a model
+### Building a JSON object in one call
+
+`falcon_obj` takes alternating `(key, type_tag, value)` triples terminated by
+`NULL`. The type tags are plain enum constants:
+
+| Tag | C type to pass |
+|---|---|
+| `FJT_STR` | `const char *` |
+| `FJT_INT` | `int` |
+| `FJT_INT64` | `long long` |
+| `FJT_DOUBLE` | `double` |
+| `FJT_BOOL` | `int` (0 = false) |
+| `FJT_NULL` | *(no value argument)* |
+| `FJT_JSON` | `cJSON *` (child object/array) |
 
 ```c
-#define TODO_FIELDS(F)                  \
-    F(INT,  id,    "id",    0)          \
-    F(STR,  title, "title", 1, 256)     \
-    F(BOOL, done,  "done",  0)
-
-FALCON_MODEL(Todo, TODO_FIELDS)
+static void get_user(falcon_ctx *ctx) {
+    falcon_json(ctx, 200,
+        falcon_obj(
+            "id",     FJT_INT,    42,
+            "name",   FJT_STR,    "Alice",
+            "active", FJT_BOOL,   1,
+            "score",  FJT_DOUBLE, 9.75,
+            NULL));
+}
+/* → {"id":42,"name":"Alice","active":true,"score":9.75} */
 ```
 
-This generates:
+One call, no `cJSON_CreateObject`, no `cJSON_AddStringToObject`.
+
+### Fluent builder
+
+Build an object field by field. Each setter returns the builder so you can
+chain calls or add fields conditionally:
 
 ```c
-typedef struct {
-    int  id;
-    char title[256];
-    int  done;
-    uint32_t _fields_set;   /* bitmask: bit N set = field N was present in JSON input */
-} Todo;
-
-cJSON *Todo_to_json  (const Todo *m);
-int    Todo_from_json(const cJSON *j, Todo *out, char *errbuf, size_t errsz);
-int    Todo_validate (const Todo *m, char *errbuf, size_t errsz);
-```
-
-### Field types
-
-| Macro | C type | JSON type | Extra arg |
-|---|---|---|---|
-| `F(INT, name, "key", req)` | `int` | number | — |
-| `F(INT64, name, "key", req)` | `long long` | number | — |
-| `F(DOUBLE, name, "key", req)` | `double` | number | — |
-| `F(BOOL, name, "key", req)` | `int` | boolean | — |
-| `F(STR, name, "key", req, maxlen)` | `char[maxlen]` | string | max length |
-
-`req=1` means required: `from_json` returns 0 with an error message if absent.
-`req=0` means optional: absent fields leave the C field zero-initialized.
-
-### Parsing a request body
-
-```c
-static void create_todo(falcon_ctx *ctx) {
-    FALCON_PARSE_BODY(ctx, Todo, body);
-    /* body.title is populated and validated — or 400 was already sent */
-
-    Todo todo = { .id = next_id(), .done = 0 };
-    strncpy(todo.title, body.title, sizeof(todo.title) - 1);
-    FALCON_SEND_MODEL(ctx, 201, &todo, Todo);
+static void get_stats(falcon_ctx *ctx) {
+    falcon_jb *j = falcon_jb_new();
+    falcon_jb_str (j, "version", "1.0");
+    falcon_jb_int (j, "users",   1234);
+    falcon_jb_bool(j, "healthy", 1);
+    falcon_jb_send(ctx, 200, j);   /* sends and frees j */
 }
 ```
 
-`FALCON_PARSE_BODY(ctx, Type, varname)` expands to:
-1. Parse `falcon_body_json(ctx)` into a `Type varname`
-2. Validate required fields
-3. On any error: send `400` with the error message and `return`
+`falcon_jb` is `cJSON` under the hood — you can use any `cJSON_*` function on
+it, and `cJSON_Delete((cJSON *)j)` frees it if you don't send it.
 
-### Sending a response
+Available setters: `falcon_jb_str`, `falcon_jb_int`, `falcon_jb_int64`,
+`falcon_jb_dbl`, `falcon_jb_bool`, `falcon_jb_null`, `falcon_jb_json`
+(for nested objects/arrays).
+
+### Struct ↔ JSON with `falcon_schema`
+
+Define any C struct you want. Then tell Falcon its layout once using
+`falcon_schema`. After that: one line to send, one line to parse.
 
 ```c
-FALCON_SEND_MODEL(ctx, 200, &todo, Todo);
-/* equivalent to: cJSON *j = Todo_to_json(&todo); falcon_json(ctx, 200, j); */
+/* Step 1 — a normal C struct, nothing special about it */
+typedef struct {
+    int  id;
+    char username[128];
+    char email[256];
+    int  age;
+    int  active;
+} User;
+
+/* Step 2 — register the layout once (call this function anywhere; the
+ * schema is built on first call and reused on every subsequent call)  */
+static falcon_schema *user_schema(void) {
+    static falcon_schema *s;
+    if (s) return s;
+    s = falcon_schema_new(sizeof(User));
+    falcon_schema_int (s, "id",       offsetof(User, id));
+    falcon_schema_str (s, "username", offsetof(User, username), 128);
+    falcon_schema_str (s, "email",    offsetof(User, email),    256);
+    falcon_schema_int (s, "age",      offsetof(User, age));
+    falcon_schema_bool(s, "active",   offsetof(User, active));
+    falcon_schema_require(s, "username");   /* 400 if missing in body */
+    falcon_schema_require(s, "email");
+    return s;
+}
 ```
 
-For arrays:
+**Struct → response (one line):**
 
 ```c
-FALCON_SEND_MODEL_ARRAY(ctx, 200, todos, count, Todo);
+static void get_user(falcon_ctx *ctx) {
+    User u = { .id = 1, .age = 25, .active = 1 };
+    strncpy(u.username, "alice",         sizeof(u.username) - 1);
+    strncpy(u.email,    "alice@example", sizeof(u.email)    - 1);
+    falcon_reply_struct(ctx, 200, &u, user_schema());
+}
+/* → {"id":1,"username":"alice","email":"alice@example","age":25,"active":true} */
 ```
 
-### Manual serialization
+**JSON body → struct (one line; sends 400 automatically on error):**
 
 ```c
-cJSON *j = Todo_to_json(&todo);
-cJSON_AddStringToObject(j, "extra_field", "value");  /* augment before sending */
+static void create_user(falcon_ctx *ctx) {
+    User u = {0};
+    if (!falcon_read_body(ctx, &u, user_schema())) return;  /* 400 already sent */
+
+    /* u.username and u.email are guaranteed populated here */
+    u.id     = next_id();
+    u.active = 1;
+    falcon_reply_struct(ctx, 201, &u, user_schema());
+}
+```
+
+**Augment before sending** (mix with raw cJSON):
+
+```c
+cJSON *j = falcon_to_json(&u, user_schema());
+cJSON_AddStringToObject(j, "token", token);   /* add extra fields */
 falcon_json(ctx, 200, j);
 ```
 
-### Tracking which fields were supplied (PATCH semantics)
-
-`_fields_set` is a bitmask set by `from_json`. Bit N corresponds to field N in
-definition order (0-indexed). Useful for PATCH endpoints where you only want to
-update supplied fields:
+**Parse without sending a response** (access the error yourself):
 
 ```c
-#define TODO_FIELDS(F) \
-    F(STR,  title, "title", 0, 256)   /* bit 0 */ \
-    F(BOOL, done,  "done",  0)        /* bit 1 */
-
-FALCON_MODEL(TodoPatch, TODO_FIELDS)
-
-static void patch_todo(falcon_ctx *ctx) {
-    FALCON_PARSE_BODY(ctx, TodoPatch, patch);
-    if (patch._fields_set & (1u << 0)) { /* title was supplied */ }
-    if (patch._fields_set & (1u << 1)) { /* done was supplied  */ }
+User u = {0};
+char errbuf[256];
+if (!falcon_from_json(body_json, &u, user_schema(), errbuf, sizeof(errbuf))) {
+    /* errbuf has the error, e.g. "missing required field: email" */
 }
 ```
+
+### Schema field functions
+
+| Function | C field type | JSON type |
+|---|---|---|
+| `falcon_schema_int(s, key, offset)` | `int` | number |
+| `falcon_schema_int64(s, key, offset)` | `long long` | number |
+| `falcon_schema_dbl(s, key, offset)` | `double` | number |
+| `falcon_schema_bool(s, key, offset)` | `int` | boolean |
+| `falcon_schema_str(s, key, offset, maxlen)` | `char[maxlen]` | string |
+
+Call `falcon_schema_require(s, key)` after registering a field to make it
+required. Fields not marked required are optional — absent keys leave the C
+field at its zero value.
+
+> **Compile-time alternative:** `<falcon/falcon_model.h>` uses C X-macros to
+> generate the struct, serializer, and deserializer from a single field list at
+> compile time (zero runtime overhead). Use it if you prefer that style — both
+> APIs do the same job.
 
 ---
 
@@ -1114,7 +1163,7 @@ Include both headers:
 
 ```c
 #include <falcon/falcon_auth.h>
-#include <falcon/falcon_model.h>
+#include <falcon/falcon_json_utils.h>
 ```
 
 **Key design rule:** signup creates the account and returns user data. Login
@@ -1123,37 +1172,57 @@ with session issuance — a user who signs up hasn't proven their password yet.
 
 #### Define your own signup shape
 
-The signup request body is yours to design. Add whatever fields your app needs.
-You are not limited to username and password — include class, department, age,
-role, or anything else. Define the shape once with an X-macro, and
-`FALCON_MODEL` generates the struct, JSON parser, and validator for you:
+The signup request body is yours to design — a plain C struct with whatever
+fields your app needs. Register the layout once and `falcon_read_body` handles
+parsing, type checking, and required-field validation for you:
 
 ```c
 /* Change these fields to match your app's registration requirements */
-#define SIGNUP_FIELDS(F)                            \
-    F(STR, username,    "username",    1, 128)      \
-    F(STR, password,    "password",    1, 128)      \
-    F(STR, display_name,"display_name",0, 256)      \
-    F(STR, role,        "role",        0,  32)      \
-    F(INT, age,         "age",         0)
+typedef struct {
+    char username[128];
+    char password[128];
+    char display_name[256];
+    char role[32];
+    int  age;
+} SignupReq;
 
-FALCON_MODEL(SignupReq, SIGNUP_FIELDS)
-/* Generates: SignupReq struct + SignupReq_from_json() + SignupReq_validate() */
+static falcon_schema *signup_schema(void) {
+    static falcon_schema *s;
+    if (s) return s;
+    s = falcon_schema_new(sizeof(SignupReq));
+    falcon_schema_str(s, "username",     offsetof(SignupReq, username),     128);
+    falcon_schema_str(s, "password",     offsetof(SignupReq, password),     128);
+    falcon_schema_str(s, "display_name", offsetof(SignupReq, display_name), 256);
+    falcon_schema_str(s, "role",         offsetof(SignupReq, role),          32);
+    falcon_schema_int(s, "age",          offsetof(SignupReq, age));
+    falcon_schema_require(s, "username");
+    falcon_schema_require(s, "password");
+    return s;
+}
 ```
 
-Required fields (`1` in the macro) return a `400` automatically if missing.
-Optional fields (`0`) are simply absent when not provided — check
-`req._fields_set & (1u << N)` if you need to distinguish "not provided" from
-the zero value.
+`falcon_schema_require` marks a field as mandatory. Missing required fields
+automatically return a `400` with a descriptive error message. Optional fields
+are left at their zero values when absent.
 
-Define a matching credentials model for login:
+Define a matching credentials struct for login:
 
 ```c
-#define LOGIN_FIELDS(F)                     \
-    F(STR, username, "username", 1, 128)    \
-    F(STR, password, "password", 1, 128)
+typedef struct {
+    char username[128];
+    char password[128];
+} LoginReq;
 
-FALCON_MODEL(LoginReq, LOGIN_FIELDS)
+static falcon_schema *login_schema(void) {
+    static falcon_schema *s;
+    if (s) return s;
+    s = falcon_schema_new(sizeof(LoginReq));
+    falcon_schema_str(s, "username", offsetof(LoginReq, username), 128);
+    falcon_schema_str(s, "password", offsetof(LoginReq, password), 128);
+    falcon_schema_require(s, "username");
+    falcon_schema_require(s, "password");
+    return s;
+}
 ```
 
 #### Users table schema
@@ -1173,7 +1242,7 @@ CREATE TABLE IF NOT EXISTS users (
 
 #### Signup handler — returns user data, not a token
 
-`FALCON_PARSE_BODY` parses the JSON body into a `SignupReq`, validates required
+`falcon_read_body` parses the JSON body into a `SignupReq`, validates required
 fields, and sends a `400` automatically on any error. The INSERT uses
 `RETURNING id` (SQLite 3.35+) to get the new row's id in the same query —
 no second round-trip needed.
@@ -1190,14 +1259,15 @@ static void cb_signup(falcon_ctx *ctx, falcon_db_result *r, const char *err) {
     SignupReq *req = falcon_ctx_get_user_data(ctx);
     falcon_db_result_free(r);
 
-    cJSON *resp = cJSON_CreateObject();
-    cJSON_AddNumberToObject(resp, "id",       uid);
-    cJSON_AddStringToObject(resp, "username", req->username);
+    cJSON *resp = falcon_obj("id", FJT_INT, uid,
+                             "username", FJT_STR, req->username,
+                             NULL);
     falcon_json(ctx, 201, resp);
 }
 
 static void signup(falcon_ctx *ctx) {
-    FALCON_PARSE_BODY(ctx, SignupReq, req);    /* 400 on bad/missing fields */
+    SignupReq req = {0};
+    if (!falcon_read_body(ctx, &req, signup_schema())) return;  /* 400 on error */
 
     char *hash = falcon_password_hash(req.password);
     if (!hash) FALCON_ABORT(ctx, 500, "server error");
@@ -1220,7 +1290,7 @@ static void signup(falcon_ctx *ctx) {
         FALCON_DB_TEXT, hash,
         req.display_name[0] ? FALCON_DB_TEXT : FALCON_DB_NULL, req.display_name,
         req.role[0]         ? FALCON_DB_TEXT : FALCON_DB_NULL, req.role,
-        (req._fields_set & (1u << 4)) ? FALCON_DB_INT : FALCON_DB_NULL, req.age,
+        req.age             ? FALCON_DB_INT  : FALCON_DB_NULL, req.age,
         FALCON_DB_END);
     free(hash);
     if (rc != 0) { falcon_db_release(conn); FALCON_ABORT(ctx, 503, "busy"); }
@@ -1266,7 +1336,8 @@ static void cb_login(falcon_ctx *ctx, falcon_db_result *r, const char *err) {
 }
 
 static void login(falcon_ctx *ctx) {
-    FALCON_PARSE_BODY(ctx, LoginReq, req);    /* 400 on bad/missing fields */
+    LoginReq req = {0};
+    if (!falcon_read_body(ctx, &req, login_schema())) return;  /* 400 on error */
 
     /* Store password for the async callback — clear it once verify is done */
     falcon_ctx_set_user_data(ctx, strdup(req.password), free);
@@ -2546,26 +2617,49 @@ Copy it to `todo_api.c`, compile, and run. No other files needed.
 #include <falcon/falcon_sqlite.h>
 #include <falcon/falcon_mw_jwt.h>
 #include <falcon/falcon_auth.h>
-#include <falcon/falcon_model.h>
+#include <falcon/falcon_json_utils.h>
 #include <falcon/falcon_middleware.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stddef.h>
 
-/* ── request body models ─────────────────────────────────────────────── */
+/* ── request body structs ────────────────────────────────────────────── */
 
-/* Change SIGNUP_FIELDS to collect whatever your app needs at registration.
- * Add class, department, age, role, or any other fields here.            */
-#define SIGNUP_FIELDS(F)                            \
-    F(STR, username, "username", 1, 128)            \
-    F(STR, password, "password", 1, 128)            \
-    F(STR, role,     "role",     0,  32)
-FALCON_MODEL(SignupReq, SIGNUP_FIELDS)
+/* Add, remove, or rename fields to match your app's registration form. */
+typedef struct {
+    char username[128];
+    char password[128];
+    char role[32];
+} SignupReq;
 
-#define LOGIN_FIELDS(F)                             \
-    F(STR, username, "username", 1, 128)            \
-    F(STR, password, "password", 1, 128)
-FALCON_MODEL(LoginReq, LOGIN_FIELDS)
+static falcon_schema *signup_schema(void) {
+    static falcon_schema *s;
+    if (s) return s;
+    s = falcon_schema_new(sizeof(SignupReq));
+    falcon_schema_str(s, "username", offsetof(SignupReq, username), 128);
+    falcon_schema_str(s, "password", offsetof(SignupReq, password), 128);
+    falcon_schema_str(s, "role",     offsetof(SignupReq, role),      32);
+    falcon_schema_require(s, "username");
+    falcon_schema_require(s, "password");
+    return s;
+}
+
+typedef struct {
+    char username[128];
+    char password[128];
+} LoginReq;
+
+static falcon_schema *login_schema(void) {
+    static falcon_schema *s;
+    if (s) return s;
+    s = falcon_schema_new(sizeof(LoginReq));
+    falcon_schema_str(s, "username", offsetof(LoginReq, username), 128);
+    falcon_schema_str(s, "password", offsetof(LoginReq, password), 128);
+    falcon_schema_require(s, "username");
+    falcon_schema_require(s, "password");
+    return s;
+}
 
 /* ── schema ──────────────────────────────────────────────────────────── */
 static const char *SCHEMA_USERS =
@@ -2615,14 +2709,15 @@ static void cb_signup(falcon_ctx *ctx, falcon_db_result *r, const char *err) {
     SignupReq *req = falcon_ctx_get_user_data(ctx);
     falcon_db_result_free(r);
 
-    cJSON *resp = cJSON_CreateObject();
-    cJSON_AddNumberToObject(resp, "id",       uid);
-    cJSON_AddStringToObject(resp, "username", req->username);
+    cJSON *resp = falcon_obj("id", FJT_INT, uid,
+                             "username", FJT_STR, req->username,
+                             NULL);
     falcon_json(ctx, 201, resp);
 }
 
 static void signup(falcon_ctx *ctx) {
-    FALCON_PARSE_BODY(ctx, SignupReq, req);
+    SignupReq req = {0};
+    if (!falcon_read_body(ctx, &req, signup_schema())) return;
 
     char *hash = falcon_password_hash(req.password);
     if (!hash) FALCON_ABORT(ctx, 500, "server error");
@@ -2678,7 +2773,8 @@ static void cb_login(falcon_ctx *ctx, falcon_db_result *r, const char *err) {
 }
 
 static void login(falcon_ctx *ctx) {
-    FALCON_PARSE_BODY(ctx, LoginReq, req);
+    LoginReq req = {0};
+    if (!falcon_read_body(ctx, &req, login_schema())) return;
 
     falcon_ctx_set_user_data(ctx, strdup(req.password), free);
 
