@@ -1110,101 +1110,127 @@ On failure: responds `401 Unauthorized` with `WWW-Authenticate: Bearer` and halt
 
 ### Issuing tokens — login and signup
 
-Include `<falcon/falcon_auth.h>` for password hashing and JWT signing. These
-utilities are part of the `falcon` library — no extra dependencies.
+Include both headers:
 
 ```c
 #include <falcon/falcon_auth.h>
+#include <falcon/falcon_model.h>
 ```
 
 **Key design rule:** signup creates the account and returns user data. Login
 authenticates and returns the token. Conflating them confuses account creation
 with session issuance — a user who signs up hasn't proven their password yet.
 
+#### Define your own signup shape
+
+The signup request body is yours to design. Add whatever fields your app needs.
+You are not limited to username and password — include class, department, age,
+role, or anything else. Define the shape once with an X-macro, and
+`FALCON_MODEL` generates the struct, JSON parser, and validator for you:
+
+```c
+/* Change these fields to match your app's registration requirements */
+#define SIGNUP_FIELDS(F)                            \
+    F(STR, username,    "username",    1, 128)      \
+    F(STR, password,    "password",    1, 128)      \
+    F(STR, display_name,"display_name",0, 256)      \
+    F(STR, role,        "role",        0,  32)      \
+    F(INT, age,         "age",         0)
+
+FALCON_MODEL(SignupReq, SIGNUP_FIELDS)
+/* Generates: SignupReq struct + SignupReq_from_json() + SignupReq_validate() */
+```
+
+Required fields (`1` in the macro) return a `400` automatically if missing.
+Optional fields (`0`) are simply absent when not provided — check
+`req._fields_set & (1u << N)` if you need to distinguish "not provided" from
+the zero value.
+
+Define a matching credentials model for login:
+
+```c
+#define LOGIN_FIELDS(F)                     \
+    F(STR, username, "username", 1, 128)    \
+    F(STR, password, "password", 1, 128)
+
+FALCON_MODEL(LoginReq, LOGIN_FIELDS)
+```
+
 #### Users table schema
+
+Add a column for each persistent field you collect at signup:
 
 ```sql
 CREATE TABLE IF NOT EXISTS users (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     username      TEXT    NOT NULL UNIQUE,
-    password_hash TEXT    NOT NULL   -- stored as "PBKDF2:<iter>:<salt_hex>:<hash_hex>"
+    password_hash TEXT    NOT NULL,   -- "PBKDF2:<iter>:<salt_hex>:<hash_hex>"
+    display_name  TEXT,
+    role          TEXT    DEFAULT 'user',
+    age           INTEGER
 );
 ```
 
 #### Signup handler — returns user data, not a token
 
-```c
-typedef struct { char username[128]; } SignupCtx;
+`FALCON_PARSE_BODY` parses the JSON body into a `SignupReq`, validates required
+fields, and sends a `400` automatically on any error. The INSERT uses
+`RETURNING id` (SQLite 3.35+) to get the new row's id in the same query —
+no second round-trip needed.
 
+```c
 static void cb_signup(falcon_ctx *ctx, falcon_db_result *r, const char *err) {
     if (err) {
-        /* UNIQUE constraint → duplicate username */
+        /* UNIQUE constraint violation → duplicate username */
         falcon_json_str(ctx, 409, "{\"error\":\"username already taken\"}");
         return;
     }
 
-    SignupCtx *sc = falcon_ctx_get_user_data(ctx);
-
-    /* Get the auto-assigned id from the last insert */
-    falcon_db_conn *conn2 = falcon_db_acquire(ctx);
-    if (!conn2) {
-        falcon_db_result_free(r);
-        falcon_json_str(ctx, 503, "{\"error\":\"busy\"}");
-        return;
-    }
-    falcon_db_result *id_r = falcon_db_query(conn2,
-        "SELECT id FROM users WHERE username = ?",
-        FALCON_DB_TEXT, sc->username, FALCON_DB_END);
-    falcon_db_release(conn2);
+    int uid = atoi(falcon_db_result_get(r, 0, 0) ?: "0");
+    SignupReq *req = falcon_ctx_get_user_data(ctx);
     falcon_db_result_free(r);
-
-    int uid = id_r ? atoi(falcon_db_result_get(id_r, 0, 0) ?: "0") : 0;
-    falcon_db_result_free(id_r);
 
     cJSON *resp = cJSON_CreateObject();
     cJSON_AddNumberToObject(resp, "id",       uid);
-    cJSON_AddStringToObject(resp, "username", sc->username);
+    cJSON_AddStringToObject(resp, "username", req->username);
     falcon_json(ctx, 201, resp);
 }
 
 static void signup(falcon_ctx *ctx) {
-    cJSON *body = falcon_body_json(ctx);
-    if (!body) FALCON_ABORT(ctx, 400, "invalid JSON");
+    FALCON_PARSE_BODY(ctx, SignupReq, req);    /* 400 on bad/missing fields */
 
-    cJSON *j_user = cJSON_GetObjectItem(body, "username");
-    cJSON *j_pass = cJSON_GetObjectItem(body, "password");
-    if (!cJSON_IsString(j_user) || !j_user->valuestring[0] ||
-        !cJSON_IsString(j_pass) || !j_pass->valuestring[0])
-        FALCON_ABORT(ctx, 400, "username and password required");
-
-    /* Hash the password — returns "PBKDF2:<iter>:<salt_hex>:<hash_hex>" */
-    char *hash = falcon_password_hash(j_pass->valuestring);
+    char *hash = falcon_password_hash(req.password);
     if (!hash) FALCON_ABORT(ctx, 500, "server error");
 
-    /* Store username for the callback (body JSON is request-scoped, not safe
-     * to hold a pointer across an async boundary if body gets modified) */
-    SignupCtx *sc = malloc(sizeof(*sc));
-    strncpy(sc->username, j_user->valuestring, sizeof(sc->username) - 1);
-    sc->username[sizeof(sc->username) - 1] = '\0';
-    falcon_ctx_set_user_data(ctx, sc, free);
+    /* Copy req to the heap — it's needed by the async callback after
+     * signup() returns.  Clear the plaintext password immediately. */
+    SignupReq *stored = malloc(sizeof(*stored));
+    if (!stored) { free(hash); FALCON_ABORT(ctx, 503, "out of memory"); }
+    *stored = req;
+    memset(stored->password, 0, sizeof(stored->password));
+    falcon_ctx_set_user_data(ctx, stored, free);
 
     falcon_db_conn *conn = falcon_db_acquire(ctx);
     if (!conn) { free(hash); FALCON_ABORT(ctx, 503, "busy"); }
 
     int rc = falcon_db_async_query(ctx, conn, cb_signup,
-        "INSERT INTO users (username, password_hash) VALUES (?, ?)",
-        FALCON_DB_TEXT, j_user->valuestring,
+        "INSERT INTO users (username, password_hash, display_name, role, age)"
+        " VALUES (?, ?, ?, ?, ?) RETURNING id",
+        FALCON_DB_TEXT, req.username,
         FALCON_DB_TEXT, hash,
+        req.display_name[0] ? FALCON_DB_TEXT : FALCON_DB_NULL, req.display_name,
+        req.role[0]         ? FALCON_DB_TEXT : FALCON_DB_NULL, req.role,
+        (req._fields_set & (1u << 4)) ? FALCON_DB_INT : FALCON_DB_NULL, req.age,
         FALCON_DB_END);
     free(hash);
     if (rc != 0) { falcon_db_release(conn); FALCON_ABORT(ctx, 503, "busy"); }
 }
 ```
 
-> **User-data pattern:** to pass data into an async callback, store a
-> heap-allocated struct before the async call with
-> `falcon_ctx_set_user_data(ctx, ptr, free)` and retrieve it in the callback
-> with `falcon_ctx_get_user_data(ctx)`.
+> **User-data pattern:** store a heap-allocated struct before the async call
+> with `falcon_ctx_set_user_data(ctx, ptr, free)` and retrieve it in the
+> callback with `falcon_ctx_get_user_data(ctx)`. The framework calls `free`
+> automatically when the request ends.
 
 #### Login handler — returns the token
 
@@ -1216,10 +1242,11 @@ static void cb_login(falcon_ctx *ctx, falcon_db_result *r, const char *err) {
         return;
     }
 
-    /* Copy out of the result before freeing it */
     char username[128], stored_hash[256];
     strncpy(username,    falcon_db_result_get(r, 0, 0) ?: "", sizeof(username) - 1);
     strncpy(stored_hash, falcon_db_result_get(r, 0, 1) ?: "", sizeof(stored_hash) - 1);
+    username[sizeof(username) - 1]       = '\0';
+    stored_hash[sizeof(stored_hash) - 1] = '\0';
     falcon_db_result_free(r);
 
     const char *password = (const char *)falcon_ctx_get_user_data(ctx);
@@ -1229,7 +1256,7 @@ static void cb_login(falcon_ctx *ctx, falcon_db_result *r, const char *err) {
     }
 
     const char *secret = getenv("FALCON_JWT_SECRET");
-    char *token = falcon_jwt_sign(username, secret, 3600);  /* 1-hour token */
+    char *token = falcon_jwt_sign(username, secret, 3600);
     if (!token) { falcon_json_str(ctx, 500, "{\"error\":\"sign failed\"}"); return; }
 
     cJSON *resp = cJSON_CreateObject();
@@ -1239,24 +1266,17 @@ static void cb_login(falcon_ctx *ctx, falcon_db_result *r, const char *err) {
 }
 
 static void login(falcon_ctx *ctx) {
-    cJSON *body = falcon_body_json(ctx);
-    if (!body) FALCON_ABORT(ctx, 400, "invalid JSON");
+    FALCON_PARSE_BODY(ctx, LoginReq, req);    /* 400 on bad/missing fields */
 
-    cJSON *j_user = cJSON_GetObjectItem(body, "username");
-    cJSON *j_pass = cJSON_GetObjectItem(body, "password");
-    if (!cJSON_IsString(j_user) || !cJSON_IsString(j_pass))
-        FALCON_ABORT(ctx, 400, "username and password required");
-
-    /* Store password for the callback — body JSON is cached per-request but
-     * strdup is safer for async code that may outlive the request object */
-    falcon_ctx_set_user_data(ctx, strdup(j_pass->valuestring), free);
+    /* Store password for the async callback — clear it once verify is done */
+    falcon_ctx_set_user_data(ctx, strdup(req.password), free);
 
     falcon_db_conn *conn = falcon_db_acquire(ctx);
     if (!conn) FALCON_ABORT(ctx, 503, "busy");
 
     falcon_db_async_query(ctx, conn, cb_login,
         "SELECT username, password_hash FROM users WHERE username = ?",
-        FALCON_DB_TEXT, j_user->valuestring,
+        FALCON_DB_TEXT, req.username,
         FALCON_DB_END);
 }
 ```
@@ -1277,11 +1297,17 @@ falcon_router_use(api, jwt_auth);
 #### Try it
 
 ```bash
-# Sign up → receives user data (not a token)
+# Sign up with all optional fields
 curl -X POST http://localhost:8080/auth/signup \
   -H 'Content-Type: application/json' \
-  -d '{"username":"alice","password":"s3cur3"}'
+  -d '{"username":"alice","password":"s3cur3","display_name":"Alice","role":"admin","age":30}'
 # {"id":1,"username":"alice"}
+
+# Sign up with just the required fields
+curl -X POST http://localhost:8080/auth/signup \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"bob","password":"hunter2"}'
+# {"id":2,"username":"bob"}
 
 # Log in → receives the token
 curl -X POST http://localhost:8080/auth/login \
@@ -2520,17 +2546,34 @@ Copy it to `todo_api.c`, compile, and run. No other files needed.
 #include <falcon/falcon_sqlite.h>
 #include <falcon/falcon_mw_jwt.h>
 #include <falcon/falcon_auth.h>
+#include <falcon/falcon_model.h>
 #include <falcon/falcon_middleware.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* ── request body models ─────────────────────────────────────────────── */
+
+/* Change SIGNUP_FIELDS to collect whatever your app needs at registration.
+ * Add class, department, age, role, or any other fields here.            */
+#define SIGNUP_FIELDS(F)                            \
+    F(STR, username, "username", 1, 128)            \
+    F(STR, password, "password", 1, 128)            \
+    F(STR, role,     "role",     0,  32)
+FALCON_MODEL(SignupReq, SIGNUP_FIELDS)
+
+#define LOGIN_FIELDS(F)                             \
+    F(STR, username, "username", 1, 128)            \
+    F(STR, password, "password", 1, 128)
+FALCON_MODEL(LoginReq, LOGIN_FIELDS)
 
 /* ── schema ──────────────────────────────────────────────────────────── */
 static const char *SCHEMA_USERS =
     "CREATE TABLE IF NOT EXISTS users ("
     "  id            INTEGER PRIMARY KEY AUTOINCREMENT,"
     "  username      TEXT    NOT NULL UNIQUE,"
-    "  password_hash TEXT    NOT NULL"
+    "  password_hash TEXT    NOT NULL,"
+    "  role          TEXT    DEFAULT 'user'"
     ")";
 
 static const char *SCHEMA_TODOS =
@@ -2562,61 +2605,43 @@ static void jwt_auth(falcon_ctx *ctx, falcon_next_fn next) {
 }
 
 /* ── auth: signup ────────────────────────────────────────────────────── */
-typedef struct { char username[128]; } SignupData;
-
 static void cb_signup(falcon_ctx *ctx, falcon_db_result *r, const char *err) {
     if (err) {
         falcon_json_str(ctx, 409, "{\"error\":\"username taken\"}");
         return;
     }
+
+    int uid = atoi(falcon_db_result_get(r, 0, 0) ?: "0");
+    SignupReq *req = falcon_ctx_get_user_data(ctx);
     falcon_db_result_free(r);
-
-    SignupData *d = falcon_ctx_get_user_data(ctx);
-
-    /* Fetch the newly created id — conn2 is synchronous (boot-time only,
-     * but signup is low-frequency so one sync query is fine here) */
-    falcon_db_conn *conn2 = falcon_db_acquire(ctx);
-    int uid = 0;
-    if (conn2) {
-        falcon_db_result *ir = falcon_db_query(conn2,
-            "SELECT id FROM users WHERE username = ?",
-            FALCON_DB_TEXT, d->username, FALCON_DB_END);
-        falcon_db_release(conn2);
-        if (ir) { uid = atoi(falcon_db_result_get(ir, 0, 0) ?: "0"); }
-        falcon_db_result_free(ir);
-    }
 
     cJSON *resp = cJSON_CreateObject();
     cJSON_AddNumberToObject(resp, "id",       uid);
-    cJSON_AddStringToObject(resp, "username", d->username);
+    cJSON_AddStringToObject(resp, "username", req->username);
     falcon_json(ctx, 201, resp);
 }
 
 static void signup(falcon_ctx *ctx) {
-    cJSON *body = falcon_body_json(ctx);
-    if (!body) FALCON_ABORT(ctx, 400, "invalid JSON");
+    FALCON_PARSE_BODY(ctx, SignupReq, req);
 
-    cJSON *j_user = cJSON_GetObjectItem(body, "username");
-    cJSON *j_pass = cJSON_GetObjectItem(body, "password");
-    if (!cJSON_IsString(j_user) || !j_user->valuestring[0] ||
-        !cJSON_IsString(j_pass) || !j_pass->valuestring[0])
-        FALCON_ABORT(ctx, 400, "username and password required");
-
-    char *hash = falcon_password_hash(j_pass->valuestring);
+    char *hash = falcon_password_hash(req.password);
     if (!hash) FALCON_ABORT(ctx, 500, "server error");
 
-    SignupData *d = malloc(sizeof(*d));
-    strncpy(d->username, j_user->valuestring, sizeof(d->username) - 1);
-    d->username[sizeof(d->username) - 1] = '\0';
-    falcon_ctx_set_user_data(ctx, d, free);
+    SignupReq *stored = malloc(sizeof(*stored));
+    if (!stored) { free(hash); FALCON_ABORT(ctx, 503, "out of memory"); }
+    *stored = req;
+    memset(stored->password, 0, sizeof(stored->password));
+    falcon_ctx_set_user_data(ctx, stored, free);
 
     falcon_db_conn *conn = falcon_db_acquire(ctx);
     if (!conn) { free(hash); FALCON_ABORT(ctx, 503, "busy"); }
 
     int rc = falcon_db_async_query(ctx, conn, cb_signup,
-        "INSERT INTO users (username, password_hash) VALUES (?, ?)",
-        FALCON_DB_TEXT, j_user->valuestring,
+        "INSERT INTO users (username, password_hash, role)"
+        " VALUES (?, ?, ?) RETURNING id",
+        FALCON_DB_TEXT, req.username,
         FALCON_DB_TEXT, hash,
+        req.role[0] ? FALCON_DB_TEXT : FALCON_DB_NULL, req.role,
         FALCON_DB_END);
     free(hash);
     if (rc != 0) { falcon_db_release(conn); FALCON_ABORT(ctx, 503, "busy"); }
@@ -2633,6 +2658,8 @@ static void cb_login(falcon_ctx *ctx, falcon_db_result *r, const char *err) {
     char username[128], stored_hash[256];
     strncpy(username,    falcon_db_result_get(r, 0, 0) ?: "", sizeof(username) - 1);
     strncpy(stored_hash, falcon_db_result_get(r, 0, 1) ?: "", sizeof(stored_hash) - 1);
+    username[sizeof(username) - 1]       = '\0';
+    stored_hash[sizeof(stored_hash) - 1] = '\0';
     falcon_db_result_free(r);
 
     const char *password = (const char *)falcon_ctx_get_user_data(ctx);
@@ -2651,22 +2678,16 @@ static void cb_login(falcon_ctx *ctx, falcon_db_result *r, const char *err) {
 }
 
 static void login(falcon_ctx *ctx) {
-    cJSON *body = falcon_body_json(ctx);
-    if (!body) FALCON_ABORT(ctx, 400, "invalid JSON");
+    FALCON_PARSE_BODY(ctx, LoginReq, req);
 
-    cJSON *j_user = cJSON_GetObjectItem(body, "username");
-    cJSON *j_pass = cJSON_GetObjectItem(body, "password");
-    if (!cJSON_IsString(j_user) || !cJSON_IsString(j_pass))
-        FALCON_ABORT(ctx, 400, "username and password required");
-
-    falcon_ctx_set_user_data(ctx, strdup(j_pass->valuestring), free);
+    falcon_ctx_set_user_data(ctx, strdup(req.password), free);
 
     falcon_db_conn *conn = falcon_db_acquire(ctx);
     if (!conn) FALCON_ABORT(ctx, 503, "busy");
 
     falcon_db_async_query(ctx, conn, cb_login,
         "SELECT username, password_hash FROM users WHERE username = ?",
-        FALCON_DB_TEXT, j_user->valuestring,
+        FALCON_DB_TEXT, req.username,
         FALCON_DB_END);
 }
 
